@@ -1,6 +1,6 @@
 # Finance Taxonomy
 
-The finance pack uses a controlled taxonomy for source classification, article classification, tags, and importance scoring.
+The finance pack is the built-in domain package for investment research workflows. It uses a controlled taxonomy for source classification, article classification, tags, and importance scoring. The same domain-pack shape can be reused for other research domains by replacing the taxonomy, scoring rubric, and application targets.
 
 Core shape:
 

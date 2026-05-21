@@ -1,6 +1,6 @@
 # 架构设计
 
-`wechat-mp-feed` 的核心定位是微信公众号长期跟踪的编排层。它通过 HTTP adapter 调用常驻下载服务，再把结果沉淀为可审核、可调度、可摘要的本地 feed 数据。
+`wechat-mp-feed` 的核心定位是微信公众号长期跟踪的编排层。Feed 层负责来源接入、文章更新、正文提取和本地存储；项目通过 HTTP adapter 调用常驻下载服务，再把结果沉淀为可审核、可调度、可摘要的本地 feed 数据。具体业务行为由分类体系、评分规则、标签和应用目标决定，内置金融投研领域包可按实际研究目标调整或替换。
 
 ## 总览图
 
@@ -18,7 +18,7 @@ flowchart TB
   Package --> Adapter[HTTP Adapter]
   Package --> Storage[(SQLite Storage)]
   Package --> Classifier[Classifier / Scoring]
-  Package --> Digest[Digest / Delivery]
+  Package --> Digest[摘要 / 分发（Delivery）]
 
   Adapter --> WDA[wechat-download-api<br/>HTTP Service]
   WDA --> WeChat[WeChat MP Backend<br/>Article Pages]
@@ -48,7 +48,8 @@ flowchart TB
 | Collector | 从长期来源库拉取文章列表并写入 `articles` |
 | Extractor | 获取正文、图片元数据并写入内容表 |
 | Rate Limit / Backoff | 按 tier 控制默认来源数、文章数、间隔和重试 |
-| Classifier / Digest | 规则版分类、重要性评分、digest；LLM job export/import |
+| 领域包 | 提供分类体系、评分规则、标签、来源属性和应用目标；内置金融投研领域包 |
+| 分类 / 摘要 | 规则版分类、重要性评分、摘要（digest）；LLM job export/import |
 
 ## 数据流：导入与审核
 
@@ -114,6 +115,11 @@ sequenceDiagram
   CLI->>DB: import LLM results / review apply
   CLI->>DB: export strict compact review table
   CLI-->>U: onboarding-review.xlsx/csv
+  U->>CLI: apply reviewed table
+  CLI->>DB: sources marked active
+  CLI->>A: collect history, 90-day metadata backfill
+  A->>S: paged article list by fakeid
+  CLI->>DB: save recent article metadata
 ```
 
 首次录入写入顺序：
@@ -121,6 +127,7 @@ sequenceDiagram
 1. `source_imports`：原始 OCR/list 名称。
 2. `source_candidates`：公众号搜索候选。
 3. `sources`：人工、规则或 LLM 确认后的长期管理来源。
+4. `articles`：首次接入完成后的近期文章元数据回补结果。
 
 `export onboarding` 是这条链路的检查点，用于让用户看到每个候选的状态和证据。
 
@@ -131,6 +138,23 @@ sequenceDiagram
 - `similar`、`different`、`unresolved` 不进入 `match账号`，只进入候选账号，并强制人工确认。
 - LLM onboarding 可以接受、忽略、拒绝或标记人工确认；重新导入 LLM 结果时，若新判断为忽略/拒绝，会把此前误接纳的关联 source 标记为 `archived`。
 
+## 数据流：语义 feed 层
+
+```mermaid
+flowchart TB
+  A["增量文章元数据"] --> B["metadata 阶段 LLM jobs"]
+  B --> C["分项公式评分 + 低信号覆盖规则"]
+  C --> D["正文抓取队列"]
+  D --> E["正文 / HTML / 结构 / 图片资产"]
+  E --> F["content 阶段 LLM jobs"]
+  F --> G["最终评分 + 应用目标"]
+  G --> H["摘要包（digest packs）"]
+  G --> I["摘要上下文（digest context）"]
+  I --> J["最终周报 / 研究 inbox / 策略池"]
+```
+
+语义 feed 层把“是否值得抓正文”和“最终如何使用”分开。metadata 阶段偏召回，用于筛选正文抓取队列；content 阶段读取正文后生成最终评分、应用目标、保存层级和摘要记录（digest records）。摘要上下文（`digest-context`）把最终摘要（digest）与原文正文、结构化内容和图片资产连接起来，避免应用层输出只依赖中间摘要。
+
 ## 数据流：长期采集目标
 
 ```mermaid
@@ -140,7 +164,7 @@ sequenceDiagram
   participant DB as SQLite
   participant A as HTTP Adapter
   participant S as wechat-download-api
-  participant D as Digest / Delivery
+  participant D as 摘要 / 分发
 
   Cron->>CLI: mpfeed collect latest --tier core
   CLI->>DB: read active sources by tier
@@ -155,7 +179,7 @@ sequenceDiagram
   S-->>A: content/assets
   CLI->>DB: upsert article_contents/assets
 
-  CLI->>D: classify + digest
+  CLI->>D: classify + 摘要生成
   D->>DB: write classifications/digests
   D-->>Cron: daily summary / exceptions
 ```
@@ -275,4 +299,4 @@ flowchart LR
 - 历史文章列表和文章内容获取。
 - 服务健康状态。
 
-这条边界让 `wechat-mp-feed` 可以替换底层 adapter，并保持核心存储和 feed 逻辑稳定。
+该边界使 `wechat-mp-feed` 能够替换底层 adapter，并保持核心存储和 feed 逻辑稳定。

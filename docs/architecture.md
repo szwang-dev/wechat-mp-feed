@@ -1,6 +1,6 @@
 # Architecture
 
-`wechat-mp-feed` is the orchestration layer for a local, reviewable WeChat Official Account feed. It calls a user-operated downloader service through an adapter, normalizes account and article data, and stores feed data in SQLite.
+`wechat-mp-feed` is the orchestration layer for a local, reviewable WeChat Official Account feed. The feed layer calls a user-operated downloader service through an adapter, normalizes account and article data, and stores feed data in SQLite. Domain packs define taxonomy, scoring rules, tags, source attributes, and application targets; the built-in finance research pack is the default domain package.
 
 ## Layered Shape
 
@@ -39,7 +39,7 @@ flowchart TB
 | Source Registry | Store canonical account identity, tier, status, fakeid, `__biz`, and optional classification. |
 | Feed Runner | Refresh article metadata, run scoring, fetch retained content, and export feed files. |
 | Storage | Keep source imports, candidates, sources, articles, content, assets, classifications, and digests in local SQLite. |
-| Finance Pack | Provide the default taxonomy: `inclusion_tier + primary_domain + source_attribute`. |
+| Domain Pack | Provide taxonomy, scoring rules, tags, source attributes, and application targets. The included finance pack is the default domain package. |
 | Adapters | Hide downloader-specific HTTP details behind stable internal calls. |
 
 ## Feed Layer Flow
@@ -58,6 +58,23 @@ flowchart LR
 ```
 
 The first-layer feed produces structured article rows, content availability status, failure reasons, and retention metadata. Application layers can use these outputs for digests, alerts, or research inboxes.
+
+## Semantic Feed Layer
+
+```mermaid
+flowchart TB
+  A["Incremental article metadata"] --> B["Metadata-stage LLM jobs"]
+  B --> C["Formula score + low-signal override"]
+  C --> D["Retained content queue"]
+  D --> E["Fetch text / HTML / structure / assets"]
+  E --> F["Content-stage LLM jobs"]
+  F --> G["Final score + application targets"]
+  G --> H["Digest packs"]
+  G --> I["Digest context"]
+  I --> J["Final reports / research inbox / strategy backlog"]
+```
+
+The semantic layer separates selection from final analysis. Metadata-stage jobs favor recall and determine which articles deserve content fetching. Content-stage jobs use fetched article text to produce final scores, application targets, retention levels, and digest records. `digest-context` links final digest rows back to original article text, structured content, and image assets so downstream applications can use source-level evidence.
 
 ## Adapter Principle
 
@@ -81,6 +98,8 @@ flowchart TB
 ```
 
 Search handles account identity matching. Account intros and latest articles provide classification evidence after identity is reviewed.
+
+After account identity and classification review are applied, first-run onboarding should finish with a bounded recent-history metadata backfill. The backfill pages the downloader article-list API for each active source, saves recent article metadata, and gives downstream feed, cadence, and digest workflows a useful starting history instead of an empty database.
 
 ## Default Crawl Policy
 

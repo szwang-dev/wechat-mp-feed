@@ -34,6 +34,90 @@ SOURCE_ATTRIBUTE_TAGS = {
     "non_finance_org",
 }
 
+ARTICLE_IMPORTANCE_BANDS = {
+    "full_archive": "0.75-1.00: durable, high-quality research with reusable strategy logic or analytical framework; preserve full text, HTML, structure, and local images when available",
+    "important": "0.60-0.75: useful article for daily digest or follow-up research; preserve full text and article-level digest",
+    "tracking": "0.42-0.60: routine but relevant tracking item; preserve metadata, summary, and available evidence",
+    "low_signal": "0.00-0.42: recruiting, events, product marketing, generic news, reposts, or articles without reusable research logic",
+}
+
+ARTICLE_METADATA_SCORE_RUBRIC = {
+    "title_research_signal": {
+        "weight": 0.25,
+        "description": "Whether the title suggests research, strategy, model tracking, deep dive, data comment, or sector/company analysis.",
+    },
+    "source_relevance": {
+        "weight": 0.20,
+        "description": "Fit with reviewed finance sources and the user's finance research scope.",
+    },
+    "abstract_specificity": {
+        "weight": 0.20,
+        "description": "Whether the available digest/abstract contains concrete claims, data, market view, or research object instead of vague promotion.",
+    },
+    "followup_potential": {
+        "weight": 0.15,
+        "description": "Likelihood that full text could contain reusable research logic, strategy signals, or evidence worth extracting.",
+    },
+    "freshness": {
+        "weight": 0.10,
+        "description": "Freshness for the current feed cycle or near-term research workflow.",
+    },
+    "evidence_quality": {
+        "weight": 0.10,
+        "description": "How much reliable evidence is available from metadata alone; lower this when title/digest are too thin.",
+    },
+    "noise_penalty": {
+        "weight": "penalty",
+        "description": "Subtract for recruiting, events, courses, product sales, ads, boilerplate news, or account promotion.",
+    },
+}
+
+ARTICLE_SCORE_RUBRIC = {
+    "research_depth": {
+        "weight": 0.25,
+        "description": "Data, model, reasoning chain, framework, or non-trivial analytical evidence; length alone is not depth.",
+    },
+    "decision_value": {
+        "weight": 0.15,
+        "description": "Concrete usefulness for research follow-up, risk monitoring, or medium-term allocation thinking; do not reward vague inspiration or immediate trading action.",
+    },
+    "strategy_reproducibility": {
+        "weight": 0.25,
+        "description": "Whether signals, factors, indicators, portfolio logic, backtests, or data requirements can be reproduced.",
+    },
+    "timeliness": {
+        "weight": 0.10,
+        "description": "Relevance to the current market regime or near-term research workflow.",
+    },
+    "source_relevance": {
+        "weight": 0.10,
+        "description": "Fit with reviewed finance sources, especially strategy, quant, macro, fixed income, and industry research.",
+    },
+    "originality": {
+        "weight": 0.10,
+        "description": "Original or scarce insight rather than generic reposting, news aggregation, or marketing copy.",
+    },
+    "evidence_quality": {
+        "weight": 0.05,
+        "description": "Enough article evidence is available to support the score; lower this when only metadata is available.",
+    },
+    "noise_penalty": {
+        "weight": "penalty",
+        "description": "Subtract for recruiting, events, courses, product sales, ads, boilerplate news, or account promotion.",
+    },
+}
+
+ARTICLE_APPLICATION_TARGETS = {
+    "daily_digest": "Daily feed digest candidate.",
+    "weekly_report": "Weekly report material, especially recurring sell-side strategy/quant/macro views.",
+    "strategy_backlog": "Strategy or model idea worth reproducing, testing, or adding to a research backlog.",
+    "market_view": "Market timing, style, macro, rates, credit, or asset-allocation view.",
+    "industry_tracking": "Industry, supply-demand, policy, price cycle, or company-tracking material.",
+    "risk_monitoring": "Risk event, regulatory change, market stress, or negative signal worth monitoring.",
+    "source_quality_signal": "Useful evidence for evaluating the source itself, even if the article is not a digest highlight.",
+    "ignore": "Low-signal article that should not enter user-facing digest workflows.",
+}
+
 ONBOARDING_SEMANTIC_GUIDANCE = [
     (
         "First classify inclusion_tier, then primary research domain, then source_attribute. "
@@ -92,33 +176,62 @@ def build_llm_jobs(
     limit: int = 100,
     source_id: str | None = None,
     content_chars: int = 6000,
+    source_article_limit: int = 5,
+    article_content_scope: str = "content",
+    article_updated_after: str | None = None,
+    article_published_after: str | None = None,
+    article_published_before: str | None = None,
+    article_retention_levels: tuple[str, ...] | None = None,
+    article_analysis_stage: str | None = None,
 ) -> dict[str, Any]:
     jobs: list[dict[str, Any]] = []
+    resolved_article_analysis_stage = article_analysis_stage or (
+        "metadata" if article_content_scope == "metadata" else "content"
+    )
 
     if entity_type in {"all", "source"}:
-        for source in store.list_sources(limit=limit):
+        if source_id:
+            source = store.get_source(source_id)
+            sources = [source] if source else []
+        else:
+            sources = store.list_sources(limit=limit)
+        for source in sources:
+            latest_articles = store.list_articles(limit=source_article_limit, source_id=source["id"])
             jobs.append(
                 {
                     "job_id": f"source:{source['id']}",
                     "entity_type": "source",
                     "entity_id": source["id"],
                     "taxonomy": taxonomy.name,
-                    "source": source,
-                    "task": "Decide whether this account belongs in the managed finance-source registry.",
+                    "source": compact_source_for_llm(source, latest_articles),
+                    "task": (
+                        "Classify this account using semantic judgment over the account metadata and latest article "
+                        "evidence. Use the controlled taxonomy only; if no category/tag fits, return the closest "
+                        "existing option and set requires_user_confirmation=true with a short new-category suggestion."
+                    ),
                     "expected_result": source_expected_result(taxonomy),
                 }
             )
 
     if entity_type in {"all", "article"}:
-        for article in store.list_articles_with_content(limit=limit, source_id=source_id):
+        for article in store.list_articles_for_llm(
+            limit=limit,
+            source_id=source_id,
+            content_scope=article_content_scope,
+            updated_after=article_updated_after,
+            published_after=article_published_after,
+            published_before=article_published_before,
+            retention_levels=article_retention_levels,
+        ):
             jobs.append(
                 {
                     "job_id": f"article:{article['id']}",
                     "entity_type": "article",
                     "entity_id": article["id"],
+                    "analysis_stage": resolved_article_analysis_stage,
                     "taxonomy": taxonomy.name,
                     "article": compact_article(article, content_chars=content_chars),
-                    "task": "Classify this article and produce a reviewable finance digest if useful.",
+                    "task": article_task_for_stage(resolved_article_analysis_stage),
                     "expected_result": article_expected_result(taxonomy),
                 }
             )
@@ -131,8 +244,14 @@ def build_llm_jobs(
             "For sources, keep finance-related accounts active and put unrelated or stale accounts into inactive/archived status.",
             "For articles, summarize only material content; score low-signal marketing, recruiting, or event notices below normal digest thresholds.",
             "For article scoring, treat securities/fund recruiting, product sales, event invitations, account promotion, course promotion, and generic market wrap text as low-signal unless the article contains reusable research logic, data, or original analysis.",
-            "Recommended article importance bands: 0.75+ for durable research/decision-useful analysis; 0.45-0.75 for useful but routine tracking; below 0.45 for notices, recruiting, product marketing, events, reposts, or mostly boilerplate content.",
+            "Recommended article importance bands: 0.75+ for durable research with reusable strategy/framework logic; 0.60-0.75 for daily digest candidates; 0.42-0.60 for routine tracking; below 0.42 for notices, recruiting, product marketing, events, reposts, or mostly boilerplate content.",
+            "For metadata-stage jobs, use article_metadata_score_rubric to produce score_breakdown for content-fetch recall. Do not return a free-form triage_decision; the system computes fetch_required/fetch_candidate/metadata_only from the formula score plus deterministic low-signal overrides.",
+            "For content-stage jobs, use article_score_rubric for final research value scoring.",
+            "Return digest.importance_score as a reference holistic score; the importer stores the formula score computed from score_breakdown so scoring stays stable across agents.",
+            "For content-stage jobs, also return digest.application_targets using only ids from article_application_targets so downstream workflows can route articles to digest, weekly report, strategy backlog, industry tracking, or risk monitoring.",
+            "When article content is unavailable, use title, abstract, source context, and publish metadata for a preliminary score; mark the reason as metadata-only and lower confidence when the title/abstract is insufficient.",
             "Use source context as prior evidence, but do not let a core_finance source automatically promote a low-signal article.",
+            "Use only category and tag ids from the supplied taxonomy. If the taxonomy is missing a useful category or tag, use the closest existing id and explain the suggested addition in reason/notes instead of inventing a formal id.",
             "Return JSON only, shaped as {'results': [...]} where every result references job_id, entity_type, and entity_id.",
         ]
         + ONBOARDING_SEMANTIC_GUIDANCE,
@@ -153,9 +272,34 @@ def build_llm_jobs(
                 "model": "llm:<agent-or-model-name>",
             },
         },
+        "article_importance_bands": ARTICLE_IMPORTANCE_BANDS,
+        "article_metadata_score_rubric": ARTICLE_METADATA_SCORE_RUBRIC,
+        "article_score_rubric": ARTICLE_SCORE_RUBRIC,
+        "article_application_targets": ARTICLE_APPLICATION_TARGETS,
+        "article_job_filter": {
+            "content_scope": article_content_scope,
+            "updated_after": article_updated_after,
+            "published_after": article_published_after,
+            "published_before": article_published_before,
+            "retention_levels": list(article_retention_levels) if article_retention_levels else None,
+            "analysis_stage": resolved_article_analysis_stage,
+        },
         "count": len(jobs),
         "jobs": jobs,
     }
+
+
+def article_task_for_stage(analysis_stage: str) -> str:
+    if analysis_stage == "metadata":
+        return (
+            "Use only article metadata, source context, title, digest, and publish time to score whether full content "
+            "should be fetched. Return classification and digest.score_breakdown using article_metadata_score_rubric. "
+            "Do not return a free-form triage decision."
+        )
+    return (
+        "Use the article content excerpt plus source context to classify the article, produce a reviewable finance digest, "
+        "score final research value with article_score_rubric, and assign application_targets."
+    )
 
 
 def build_onboarding_llm_jobs(
@@ -272,15 +416,18 @@ def manual_onboarding_review(import_row: dict[str, Any]) -> dict[str, Any]:
 def apply_llm_results(
     store: Store,
     payload: dict[str, Any] | list[Any],
-    default_taxonomy: str,
+    default_taxonomy: str | Taxonomy,
     default_model: str,
 ) -> dict[str, Any]:
+    taxonomy = default_taxonomy if isinstance(default_taxonomy, Taxonomy) else None
+    default_taxonomy_name = taxonomy.name if taxonomy else str(default_taxonomy)
     results = payload.get("results") if isinstance(payload, dict) else payload
     if not isinstance(results, list):
         raise ValueError("LLM result JSON expects a list or an object with a 'results' list")
 
     saved_classifications = []
     saved_digests = []
+    saved_reviews = []
     source_updates = []
     skipped = []
 
@@ -296,7 +443,7 @@ def apply_llm_results(
             continue
 
         if entity_type == ONBOARDING_JOB_ENTITY_TYPE:
-            onboarding_result = apply_onboarding_result(store, item, default_taxonomy, default_model)
+            onboarding_result = apply_onboarding_result(store, item, default_taxonomy_name, default_model, taxonomy)
             if onboarding_result.get("classification"):
                 saved_classifications.append(onboarding_result["classification"])
             if onboarding_result.get("source_update"):
@@ -305,9 +452,25 @@ def apply_llm_results(
                 skipped.append(onboarding_result["skipped"])
             continue
 
-        classification = normalize_classification(item, default_taxonomy, default_model)
+        if entity_type == "source" and item.get("requires_user_confirmation"):
+            review = normalize_source_classification_review(item, default_taxonomy_name, default_model)
+            if not review:
+                skipped.append({"reason": "requires_user_confirmation_without_classification", "result": item})
+                continue
+            validation_error = validate_source_classification_review_for_taxonomy(review, taxonomy)
+            if validation_error:
+                skipped.append({"reason": validation_error, "result": item})
+                continue
+            saved_reviews.append(store.save_source_classification_review(review))
+            continue
+
+        classification = normalize_classification(item, default_taxonomy_name, default_model)
         if classification:
-            saved_classifications.append(store.save_classification(classification))
+            validation_error = validate_classification_for_taxonomy(classification, taxonomy)
+            if validation_error:
+                skipped.append({"reason": validation_error, "result": item})
+            else:
+                saved_classifications.append(store.save_classification(classification))
 
         if entity_type == "source":
             source_update = item.get("source_update") if isinstance(item.get("source_update"), dict) else item
@@ -325,11 +488,13 @@ def apply_llm_results(
         "results_seen": len(results),
         "classifications_saved": len(saved_classifications),
         "digests_saved": len(saved_digests),
+        "source_classification_reviews_saved": len(saved_reviews),
         "source_updates": len(source_updates),
         "skipped": skipped,
         "items": {
             "classifications": saved_classifications,
             "digests": saved_digests,
+            "source_classification_reviews": saved_reviews,
             "source_updates": source_updates,
         },
     }
@@ -340,6 +505,7 @@ def apply_onboarding_result(
     item: dict[str, Any],
     default_taxonomy: str,
     default_model: str,
+    taxonomy: Taxonomy | None = None,
 ) -> dict[str, Any]:
     import_id = item["entity_id"]
     action = str(item.get("action") or item.get("decision") or "").strip().lower()
@@ -359,6 +525,9 @@ def apply_onboarding_result(
         saved_classification = None
         classification = normalize_onboarding_classification(item, accepted["source_id"], default_taxonomy, default_model)
         if classification:
+            validation_error = validate_classification_for_taxonomy(classification, taxonomy)
+            if validation_error:
+                return {"skipped": {"reason": validation_error, "result": item}}
             saved_classification = store.save_classification(classification)
         return {
             "classification": saved_classification,
@@ -445,6 +614,9 @@ def normalize_classification(item: dict[str, Any], default_taxonomy: str, defaul
     tags = nested.get("tags", item.get("tags") or [])
     if isinstance(tags, str):
         tags = [part.strip() for part in tags.split(",") if part.strip()]
+    source_attribute = nested.get("source_attribute") or item.get("source_attribute")
+    if item.get("entity_type") == "source" and source_attribute and source_attribute not in tags:
+        tags.append(source_attribute)
     return {
         "entity_type": item["entity_type"],
         "entity_id": item["entity_id"],
@@ -464,14 +636,196 @@ def normalize_digest(item: dict[str, Any], default_model: str) -> dict[str, Any]
     summary = digest.get("summary")
     if not article_id or not summary:
         return None
+    analysis_stage = normalize_analysis_stage(digest.get("analysis_stage") or item.get("analysis_stage"))
+    model_score = normalize_importance_score(digest.get("importance_score"))
+    score_breakdown = normalize_score_breakdown(digest.get("score_breakdown"), analysis_stage=analysis_stage)
+    importance_score = model_score
+    if score_breakdown:
+        importance_score = compute_importance_score_from_breakdown(score_breakdown, analysis_stage=analysis_stage)
+        score_breakdown["model_importance_score"] = model_score
+        score_breakdown["computed_importance_score"] = importance_score
     return {
         "article_id": article_id,
         "summary": summary,
         "key_points": digest.get("key_points") or [],
-        "importance_score": digest.get("importance_score") or 0,
+        "importance_score": importance_score,
+        "score_breakdown": score_breakdown,
+        "application_targets": normalize_application_targets(digest.get("application_targets")),
         "reason": digest.get("reason"),
         "model": digest.get("model") or default_model,
+        "analysis_stage": analysis_stage,
     }
+
+
+def normalize_source_classification_review(
+    item: dict[str, Any],
+    default_taxonomy: str,
+    default_model: str,
+) -> dict[str, Any] | None:
+    classification = normalize_classification(item, default_taxonomy, default_model)
+    if not classification or classification.get("entity_type") != "source":
+        return None
+    nested = item.get("classification") if isinstance(item.get("classification"), dict) else {}
+    source_attribute = nested.get("source_attribute") or item.get("source_attribute")
+    return {
+        "source_id": classification["entity_id"],
+        "taxonomy": classification["taxonomy"],
+        "category": classification["category"],
+        "source_attribute": source_attribute,
+        "tags": classification.get("tags") or [],
+        "confidence": classification.get("confidence") or 0,
+        "method": classification.get("method") or default_model,
+        "reason": item.get("reason") or item.get("notes") or "",
+        "taxonomy_suggestions": item.get("taxonomy_suggestions") or [],
+        "status": "pending",
+        "raw_payload": item,
+    }
+
+
+def normalize_importance_score(value: Any) -> float:
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return round(max(0.0, min(1.0, score)), 3)
+
+
+def normalize_score_breakdown(value: Any, analysis_stage: str = "content") -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    rubric = score_rubric_for_analysis_stage(analysis_stage, value)
+    normalized: dict[str, Any] = {}
+    for key in rubric:
+        if key not in value:
+            continue
+        raw_score = value.get(key)
+        if key == "noise_penalty":
+            try:
+                score = float(raw_score)
+            except (TypeError, ValueError):
+                continue
+            normalized[key] = round(max(-1.0, min(0.0, score)), 3)
+            continue
+        normalized[key] = normalize_importance_score(raw_score)
+    notes = value.get("notes") or value.get("reason")
+    if notes:
+        normalized["notes"] = str(notes)
+    return normalized
+
+
+def score_rubric_for_analysis_stage(analysis_stage: str, score_breakdown: dict[str, Any] | None = None) -> dict[str, Any]:
+    if analysis_stage == "metadata":
+        if not score_breakdown:
+            return ARTICLE_METADATA_SCORE_RUBRIC
+        metadata_keys = set(ARTICLE_METADATA_SCORE_RUBRIC) - {"noise_penalty"}
+        if any(key in score_breakdown for key in metadata_keys):
+            return ARTICLE_METADATA_SCORE_RUBRIC
+    return ARTICLE_SCORE_RUBRIC
+
+
+def compute_importance_score_from_breakdown(score_breakdown: dict[str, Any], analysis_stage: str = "content") -> float:
+    score = 0.0
+    has_weighted_item = False
+    rubric_items = score_rubric_for_analysis_stage(analysis_stage, score_breakdown)
+    for key, rubric in rubric_items.items():
+        if key == "noise_penalty" or key not in score_breakdown:
+            continue
+        weight = rubric.get("weight")
+        if isinstance(weight, (int, float)):
+            score += float(score_breakdown[key]) * weight
+            has_weighted_item = True
+    if not has_weighted_item:
+        return 0.0
+    score += float(score_breakdown.get("noise_penalty") or 0)
+    return normalize_importance_score(score)
+
+
+def normalize_application_targets(value: Any) -> list[str]:
+    if isinstance(value, str):
+        value = [part.strip() for part in value.split(",") if part.strip()]
+    if not isinstance(value, list):
+        return []
+    targets: list[str] = []
+    for item in value:
+        target = str(item).strip()
+        if target in ARTICLE_APPLICATION_TARGETS and target not in targets:
+            targets.append(target)
+    return targets
+
+
+def normalize_analysis_stage(value: Any) -> str:
+    stage = str(value or "").strip().lower()
+    if stage in {"metadata", "content", "rules"}:
+        return stage
+    return "content"
+
+
+def validate_classification_for_taxonomy(classification: dict[str, Any], taxonomy: Taxonomy | None) -> str | None:
+    if taxonomy is None:
+        return None
+    entity_type = classification.get("entity_type")
+    if entity_type == "source":
+        category_ids = {entry.id for entry in taxonomy.source_categories}
+    elif entity_type == "article":
+        category_ids = {entry.id for entry in taxonomy.article_categories}
+    else:
+        return f"unsupported_entity_type:{entity_type}"
+    category = classification.get("category")
+    if category not in category_ids:
+        return f"invalid_category:{category}"
+    tag_ids = {tag.id for group in taxonomy.tag_groups for tag in group.tags}
+    for tag in classification.get("tags") or []:
+        if tag not in tag_ids:
+            return f"invalid_tag:{tag}"
+    return None
+
+
+def validate_source_classification_review_for_taxonomy(review: dict[str, Any], taxonomy: Taxonomy | None) -> str | None:
+    if taxonomy is None:
+        return None
+    classification = {
+        "entity_type": "source",
+        "entity_id": review["source_id"],
+        "taxonomy": review["taxonomy"],
+        "category": review["category"],
+        "tags": review.get("tags") or [],
+    }
+    validation_error = validate_classification_for_taxonomy(classification, taxonomy)
+    if validation_error:
+        return validation_error
+    source_attribute = review.get("source_attribute")
+    if source_attribute:
+        source_attributes = {
+            tag.id
+            for group in taxonomy.tag_groups
+            if group.id == "source_attribute"
+            for tag in group.tags
+        }
+        if source_attribute not in source_attributes:
+            return f"invalid_source_attribute:{source_attribute}"
+    suggestions = review.get("taxonomy_suggestions") or []
+    if suggestions and not isinstance(suggestions, list):
+        return "invalid_taxonomy_suggestions"
+    return None
+
+
+def compact_source_for_llm(source: dict[str, Any], latest_articles: list[dict[str, Any]]) -> dict[str, Any]:
+    item = compact_source(source) or {}
+    for key in ("wechat_fakeid", "biz", "source_type", "created_at", "updated_at"):
+        if source.get(key):
+            item[key] = source.get(key)
+    item["latest_articles"] = [
+        {
+            "id": article.get("id"),
+            "title": article.get("title"),
+            "digest": article.get("digest"),
+            "publish_time": article.get("publish_time"),
+            "url": article.get("url"),
+            "retention_level": article.get("retention_level"),
+        }
+        for article in latest_articles
+    ]
+    return item
 
 
 def compact_article(article: dict[str, Any], content_chars: int) -> dict[str, Any]:
@@ -565,8 +919,21 @@ def source_expected_result(taxonomy: Taxonomy) -> dict[str, Any]:
     return {
         "entity_type": "source",
         "classification.category": [entry.id for entry in taxonomy.source_categories],
+        "source_attribute": sorted(SOURCE_ATTRIBUTE_TAGS),
+        "classification.tags": "taxonomy tag ids only",
+        "classification.confidence": "0.0-1.0",
         "source_update.status": ["active", "inactive", "archived", "needs_review"],
         "source_update.tier": ["core", "normal", "long_tail"],
+        "requires_user_confirmation": "true for first-time source classification, and true whenever the account needs user review",
+        "taxonomy_suggestions": [
+            {
+                "type": "category|source_attribute|tag",
+                "suggested_id": "snake_case id",
+                "name_zh": "中文名称",
+                "reason": "why the current taxonomy is insufficient",
+            }
+        ],
+        "reason": "short Chinese explanation; include proposed new category/tag here instead of inventing formal ids",
     }
 
 
@@ -574,7 +941,13 @@ def article_expected_result(taxonomy: Taxonomy) -> dict[str, Any]:
     return {
         "entity_type": "article",
         "classification.category": [entry.id for entry in taxonomy.article_categories],
-        "digest.required": ["summary", "key_points", "importance_score", "reason", "model"],
+        "classification.tags": "taxonomy tag ids only",
+        "classification.confidence": "0.0-1.0",
+        "digest.required": ["summary", "key_points", "importance_score", "score_breakdown", "reason", "model"],
+        "digest.importance_score": "0.0-1.0 reference holistic score; importer stores the formula score computed from digest.score_breakdown",
+        "digest.score_breakdown": "Use article_metadata_score_rubric for metadata-stage jobs and article_score_rubric for content-stage jobs.",
+        "digest.application_targets": list(ARTICLE_APPLICATION_TARGETS),
+        "analysis_stage": ["metadata", "content"],
     }
 
 

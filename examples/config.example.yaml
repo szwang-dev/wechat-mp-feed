@@ -1,58 +1,32 @@
-app:
-  name: wechat-mp-feed
-
 storage:
-  backend: sqlite
   path: ./data/mpfeed.sqlite
 
-import:
-  ocr:
-    provider: paddle
-    lang: zh
-    frame_fps: 1
-    dedupe_threshold: 0.88
-    crop: null  # [x, y, width, height]
+downloader:
+  base_url: http://127.0.0.1:5001
+  timeout: 30
 
-resolve:
-  auto_accept_threshold: 0.92
-  manual_review_threshold: 0.70
-  adapters:
-    wechat_backend:
-      enabled: false
-      # Non-official backend adapter. User must provide valid session credentials.
-      cookie_env: WECHAT_MP_COOKIE
-      token_env: WECHAT_MP_TOKEN
-      rate_limit: 10/m
-
-crawl:
-  default_metadata_only: true
-  stop_on_rate_limit: true
-  delay_min_seconds: 3
-  delay_max_seconds: 15
-  tiers:
-    core:
-      max_sources_per_run: 50
-      pages_per_source: 1
-      with_content: true
-    normal:
-      max_sources_per_run: 200
-      pages_per_source: 1
-      with_content: false
-    long_tail:
-      max_sources_per_run: 500
-      pages_per_source: 1
-      with_content: false
-
-extract:
-  cache_images: false
-  cache_dir: ./data/assets
-  video_mode: metadata_only
-
-classify:
-  taxonomy: default
-  llm_enabled: false
-
-delivery:
-  default: file
-  file:
-    output_dir: ./data/exports
+feed:
+  tier: all
+  max_sources: 0
+  count: 5
+  begin: 0
+  retries: 2
+  backoff_seconds: 3.0
+  delay_min: 1.0
+  delay_max: 3.0
+  full: true
+  taxonomy: finance
+  score_limit: 0
+  content_limit: 0
+  content_retention: content_or_archive
+  content_retries: 3
+  content_backoff_seconds: 5.0
+  content_delay_min: 5.0
+  content_delay_max: 10.0
+  content_passes: 3
+  content_pass_cooldown_seconds: 60.0
+  feed_limit: 3000
+  work_dir: ./work/feed
+  feed_format: csv
+  summary_format: json
+  failures_format: csv

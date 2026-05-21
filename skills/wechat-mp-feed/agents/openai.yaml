@@ -1,4 +1,4 @@
 interface:
   display_name: "WeChat MP Feed"
-  short_description: "Operate WeChat Official Account feed workflows"
-  default_prompt: "Use $wechat-mp-feed to run an offline feed validation test and summarize the results."
+  short_description: "Operate agent-first WeChat Official Account feed workflows"
+  default_prompt: "Use $wechat-mp-feed to run the offline validation workflow and summarize the results."

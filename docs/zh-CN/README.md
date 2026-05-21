@@ -1,61 +1,80 @@
+<div align="center">
+
 # wechat-mp-feed 中文说明
 
-`wechat-mp-feed` 用于构建本地、可审核的微信公众号文章流。
+**面向 Agent 的微信公众号 feed 基础设施，内置金融投研增强层。**
 
-项目采用 agent-first 的运行模式，并保留明确的用户监督边界。用户控制本地配置、确认不确定的账号身份或分类结果，并在 downloader 需要认证时完成扫码。agent 通过 CLI 和 Skill 编排首次接入、feed 刷新、失败检查、LLM jobs 导出和金融投研工作流生成。
+[English](../../README.md) · [Agent Skill](../../skills/wechat-mp-feed/SKILL.md) · [CLI](cli.md) · [金融分类体系](finance-taxonomy.md)
 
-核心流程：
+[![CI](https://github.com/szwang-dev/wechat-mp-feed/actions/workflows/ci.yml/badge.svg)](https://github.com/szwang-dev/wechat-mp-feed/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](../../LICENSE)
+[![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue.svg)](https://www.python.org/)
+[![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)](../../.github/workflows/ci.yml)
+[![Agent Skill](https://img.shields.io/badge/agent--skill-SKILL.md-6f42c1.svg)](../../skills/wechat-mp-feed/SKILL.md)
 
-- 批量接入 CSV/JSON、截图、录屏或文章链接中的公众号关注列表。
-- 搜索并解析用户自行运行的 downloader 服务返回的公众号候选。
-- 生成账号身份、金融分类和人工修正审核表。
-- 将已审核或严格匹配的账号写入正式来源库。
-- 在 SQLite 中保存来源、文章元数据、正文、图片位置、分类和 digest。
-- 刷新文章列表，并按评分决定保存层级：`metadata`、`content`、`full_archive`。
-- 导出可检查的 feed 文件：
-  - `feed-items.csv/json`
-  - `feed-summary.json/csv`
-  - `feed-failures.csv/json`
+</div>
 
-项目内置金融增强层，用于公众号来源分类、文章初筛、重要性评分，以及后续投研 inbox / digest 工作流。
+`wechat-mp-feed` 用于把微信公众号内容转成本地 feed，支持审核、更新、检索和 agent 调用。核心 feed 层负责来源接入、文章更新、正文提取和本地存储；项目内置金融投研语义层，包含账号分类、文章分类、标签、评分规则和应用目标，并可按实际研究目标调整或替换。
 
-微信访问由用户自行运行并登录的 downloader 服务处理。`wechat-mp-feed` 通过配置好的 base URL 调用该服务。
+项目在本地 SQLite 中保存来源身份、文章元数据、正文、图片位置、分类和摘要（digest）。公众号搜索和文章抓取由用户自行运行的微信文章下载服务处理，例如 Docker 容器或本机进程。服务地址和配置流程见 [Feed 配置](config.md)。
 
-首次接入面向几百到几千个公众号。agent 分阶段执行 OCR/导入、多轮搜索、最新文章证据抓取、LLM 辅助金融分类和审核表导出；人工审核集中在账号身份未解析、分类置信度不足或需要人工修正的行。
+## 项目概览
 
-## 工作方式
+`wechat-mp-feed` 位于原始微信公众号内容和 agent 驱动的应用之间，负责稳定的 feed 层。
 
-![系统概览](../assets/zh-cn/system-overview.svg)
+项目由三层组成：
 
-首次批量接入：
+- Feed 基础层：管理来源身份、文章元数据、正文、图片位置和本地持久化。
+- 语义配置层：通过分类体系（taxonomy）、标签、评分规则和 LLM 任务（LLM jobs）解释来源和文章价值。
+- 应用输出层：导出摘要包（digest packs）、摘要上下文（digest context）和面向下游工作流的结构化结果。
 
-![首次批量接入](../assets/zh-cn/first-run-onboarding.svg)
+![三层结构](../assets/zh-cn/system-overview.svg)
 
-## Agent Skill
+## 核心流程
 
-正式 Skill 包位于：
+1. 从账号列表、截图、录屏或文章链接导入来源候选。
+2. 通过配置好的下载服务适配器（adapter）解析账号身份。
+3. 审核不确定匹配，并确认来源分类。
+4. 首次接入后回补近期文章元数据。
+5. 对已审核来源执行增量文章刷新。
+6. 通过 JSON 任务（JSON jobs）执行元数据阶段（metadata stage）和正文阶段（content stage）的 LLM 分析。
+7. 抓取保留文章正文，并为高价值文章缓存图片资产。
+8. 导出 feed 状态、摘要包（digest packs）和下游应用使用的摘要上下文（digest context）。
+
+## 主要产出
+
+`wechat-mp-feed` 的产出分为四类：
+
+- 来源库：已确认的公众号账号、状态、层级、身份字段和分类结果。
+- 文章库：文章元数据、正文、HTML、结构化正文、图片链接和图片顺序。
+- 运行报告：feed 汇总、失败列表、重试线索和下载服务状态。
+- Agent 上下文：LLM 任务（LLM jobs）、摘要包（digest packs）和摘要上下文（digest context）。
+
+表结构细节见 [存储 Schema](schema.md)。
+
+## 领域包
+
+领域包定义 feed 数据如何进入具体应用，包括账号分类、文章分类、来源属性、标签、评分规则、保存阈值和应用目标。用户可以替换或扩展领域包，用于金融投研之外的内容监控、行业情报、政策跟踪或其他研究工作流。
+
+项目内置金融投研领域包，覆盖宏观、策略、固收、金工、行业研究、公司研究、市场基础设施、媒体和 KOL 等来源类型，并提供文章评分规则和 `daily_digest`、`weekly_report`、`strategy_backlog`、`market_view`、`industry_tracking`、`risk_monitoring` 等应用目标。
+
+详见 [金融分类体系](finance-taxonomy.md)。
+
+## Agent 集成
+
+项目提供正式的 agent 技能包（agent skill）：
 
 ```text
 skills/wechat-mp-feed/
 ```
 
-支持 `SKILL.md` 的 agent 系统可以直接注册这个目录；其他系统可以把 [SKILL.md](../../skills/wechat-mp-feed/SKILL.md) 作为工作流说明注册给 agent。
+Agent 通过 `mpfeed` 执行首次接入、feed 刷新、失败检查、LLM 任务导出/导入、单账号接入、退订和重新启用。CLI 提供结构化输出和受控写入口，适合在 Codex、Claude Code 和其他 agent 系统中调用。
 
-Skill 说明以下操作：
+详见 [Agent Skill](agent-skills.md) 和 [CLI 参考](cli.md)。
 
-- 运行 `mpfeed run agent-smoke` 验证集成；
-- 批量接入首次公众号关注列表；
-- 运行 `mpfeed run feed --config`；
-- 读取 `feed-summary` 和 `feed-failures`；
-- 导出文章级 LLM jobs；
-- 把公众号名单、录屏、登录凭据、数据库和 digest 保存在用户私有路径；
-- 基于 feed 输出构建金融研究 inbox / digest。
+## 快速开始
 
-详见 [Agent Skill 包](agent-skills.md)。
-
-## 离线示例
-
-离线示例使用合成数据，不需要微信认证即可在本地生成 feed 输出。
+离线示例使用合成数据，不需要微信认证。
 
 ```bash
 PYTHONPATH=packages/wechat_mp_feed/src python3 -m wechat_mp_feed.cli \
@@ -68,7 +87,7 @@ PYTHONPATH=packages/wechat_mp_feed/src python3 -m wechat_mp_feed.cli \
   --config ./work/demo-feed/feed-config.demo.json
 ```
 
-输出：
+生成文件：
 
 ```text
 work/demo-feed/feed-items.csv
@@ -76,132 +95,26 @@ work/demo-feed/feed-summary.json
 work/demo-feed/feed-failures.csv
 ```
 
-示例数据包含核心金融、金融相关、招聘低信号和正文失败样例，用于了解 feed 层输出形态。
+微信文章下载服务、来源接入和 feed 配置请参考下方文档。
 
-## 安装
+## 文档索引
 
-本地开发安装：
+| 主题 | 链接 |
+|---|---|
+| 架构设计 | [architecture.md](architecture.md) |
+| CLI 参考 | [cli.md](cli.md) |
+| 下载服务 Adapter 契约 | [downloader-adapter.md](downloader-adapter.md) |
+| Feed 配置 | [config.md](config.md) |
+| 存储 Schema | [schema.md](schema.md) |
+| Agent Skill | [agent-skills.md](agent-skills.md) |
+| 金融分类体系 | [finance-taxonomy.md](finance-taxonomy.md) |
+| English Documentation | [../../README.md](../../README.md) |
 
-```bash
-cd packages/wechat_mp_feed
-python3 -m pip install -e .
-```
+## 数据与隐私
 
-可从仓库根目录使用源码路径运行：
+`wechat-mp-feed` 默认把运行数据保存在本地。真实公众号名单、截图或录屏、下载服务登录凭据、原始文章归档、SQLite 数据库、生成的 feed 文件和个人摘要（digest），建议放在用户控制的本地路径中，例如 `work/`、`data/`，或仓库目录之外的私有目录。
 
-```bash
-PYTHONPATH=packages/wechat_mp_feed/src python3 -m wechat_mp_feed.cli --help
-```
-
-如需截图或录屏导入，安装 OCR/视频依赖：
-
-```bash
-python3 -m pip install -e "packages/wechat_mp_feed[ocr]"
-```
-
-## 平台支持
-
-核心 feed 层面向 macOS、Linux 和 Windows。它主要使用 Python、SQLite、本地文件和 HTTP adapter；CI 会在三个系统上运行单元测试、离线示例和 agent 验证用例。
-
-可选组件对环境有额外要求：
-
-- downloader 服务由用户自行运行。Windows 上通常推荐 Docker 或 WSL。
-- OCR/录屏导入依赖 `ffmpeg` 和 PaddleOCR，本地安装可行，但 Docker/WSL 更容易复现。
-- bootstrap shell 脚本偏 Unix 环境。Windows 用户可以使用 WSL、Git Bash、Docker，或直接配置 `WECHAT_DOWNLOAD_API_BASE_URL`。
-
-## Feed 工作流
-
-启动或配置外部 downloader 服务：
-
-```bash
-./scripts/bootstrap_wechat_download_api.sh
-```
-
-完成扫码登录后验证：
-
-```bash
-export WECHAT_DOWNLOAD_API_BASE_URL=http://127.0.0.1:5000
-
-PYTHONPATH=packages/wechat_mp_feed/src python3 -m wechat_mp_feed.cli doctor --db ./data/mpfeed.sqlite
-PYTHONPATH=packages/wechat_mp_feed/src python3 -m wechat_mp_feed.cli adapter wechat-download-api auth-status
-```
-
-导入账号：
-
-```bash
-PYTHONPATH=packages/wechat_mp_feed/src python3 -m wechat_mp_feed.cli \
-  --db ./data/mpfeed.sqlite \
-  import csv examples/accounts.csv \
-  --name-column name
-```
-
-搜索候选：
-
-```bash
-PYTHONPATH=packages/wechat_mp_feed/src python3 -m wechat_mp_feed.cli \
-  --db ./data/mpfeed.sqlite \
-  resolve imports \
-  --source-type csv \
-  --limit 100
-```
-
-导出候选审核表：
-
-```bash
-PYTHONPATH=packages/wechat_mp_feed/src python3 -m wechat_mp_feed.cli \
-  --db ./data/mpfeed.sqlite \
-  export candidates \
-  --format csv > ./work/candidates.csv
-```
-
-确认候选后运行 feed：
-
-```bash
-cp examples/feed-config.example.json ./work/feed-config.json
-
-PYTHONPATH=packages/wechat_mp_feed/src python3 -m wechat_mp_feed.cli \
-  run feed \
-  --config ./work/feed-config.json
-```
-
-## 金融增强层
-
-金融增强层采用：
-
-```text
-inclusion_tier + primary_domain + source_attribute
-```
-
-例子：
-
-- `core_finance` + `macro_policy` + `sell_side`
-- `finance_related` + `quant` + `product_provider`
-- `finance_related` + `recruiting_career` + `recruiting`
-
-## 金融应用拓展
-
-Feed 层是金融工作流的数据基础。后续金融增强层可以利用来源分类、文章元数据、正文、图片位置、失败状态和文章级 LLM jobs 构建：
-
-- 按研究领域、来源层级、重要性分数组织的研究 inbox；
-- 每日或每周金融 digest；
-- 政策、宏观、策略、固收、金工、行业和公司的专题监控；
-- 对招聘、活动、营销、重复市场综述等低信号内容的过滤；
-- 基于用户反馈持续调整 taxonomy、评分阈值和 digest prompt。
-
-金融分类体系详见：
-
-- [金融分类体系](finance-taxonomy.md)
-- [Feed 配置说明](config.md)
-- [Agent Skill 包](agent-skills.md)
-- [CLI 参考](cli.md)
-- [存储 Schema](schema.md)
-- [架构设计](architecture.md)
-
-## 本地数据与隐私
-
-`wechat-mp-feed` 默认把运行数据保存在本地。真实公众号名单、截图或录屏、downloader 登录凭据、原始文章归档、SQLite 数据库、生成的 feed 文件和个人 digest，建议放在用户自己控制的本地路径中，例如 `work/`、`data/`，或仓库目录之外的私有目录。
-
-真实部署时推荐用环境变量指定私有路径：
+推荐使用环境变量指定真实部署路径：
 
 ```bash
 export WECHAT_MP_FEED_HOME=/path/to/private/mpfeed

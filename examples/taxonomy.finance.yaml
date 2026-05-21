@@ -277,9 +277,9 @@ tag_groups:
         aliases_zh: [eVTOL, 低空飞行]
 
 importance_thresholds:
-  alert: 0.85
-  digest: 0.65
-  archive: 0.35
+  full_archive: 0.75
+  digest: 0.60
+  content: 0.42
 
 llm_policy:
   allow_only_known_ids: true

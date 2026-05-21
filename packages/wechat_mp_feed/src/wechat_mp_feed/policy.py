@@ -45,9 +45,23 @@ def tier_policy(tier: str) -> TierPolicy:
 
 def retryable_status(payload: dict[str, Any]) -> bool:
     status = payload.get("status")
+    if status == 0:
+        return True
     if isinstance(status, int) and (status == 429 or 500 <= status <= 599):
         return True
     body = payload.get("body")
     error = body.get("error") if isinstance(body, dict) else None
     text = str(error or "")
-    return "Rate limited" in text or "过快" in text or "重试" in text
+    retryable_fragments = (
+        "Rate limited",
+        "过快",
+        "重试",
+        "Network is unreachable",
+        "Connection refused",
+        "Connection reset",
+        "timed out",
+        "Temporary failure",
+        "Name or service not known",
+        "nodename nor servname",
+    )
+    return any(fragment in text for fragment in retryable_fragments)

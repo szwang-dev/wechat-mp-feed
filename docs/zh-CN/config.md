@@ -39,12 +39,26 @@ examples/feed-config.example.json
 
 ## Downloader
 
+微信文章访问由用户自行运行并登录的下载服务处理。将 `wechat-mp-feed` 配置为通过 HTTP 调用该服务。本地开发时，仓库提供了一个辅助脚本，可启动外部 `wechat-download-api` 服务：
+
+```bash
+./scripts/bootstrap_wechat_download_api.sh
+```
+
+服务启动后，打开终端输出的登录地址；如需登录，使用微信扫码。然后配置服务地址：
+
+```bash
+export WECHAT_DOWNLOAD_API_BASE_URL=http://127.0.0.1:5000
+```
+
 | 字段 | 含义 |
 |---|---|
-| `downloader.base_url` | 外部 downloader 服务地址，等价于 `--base-url`。 |
+| `downloader.base_url` | 外部下载服务地址，等价于 `--base-url`。 |
 | `downloader.timeout` | HTTP 超时时间，单位秒，等价于 `--timeout`。 |
 
-downloader 由用户自行部署和登录。登录态由 downloader 或用户配置的本地环境管理；`wechat-mp-feed` 通过 base URL 和可选 token 调用已配置的服务。
+下载服务由用户自行部署和登录。登录态由下载服务或用户配置的本地环境管理；`wechat-mp-feed` 通过 base URL 和可选 token 调用已配置的服务。
+
+默认适配器（adapter）面向 `wechat-download-api`；其他下载服务只要实现相同操作和响应结构，也可以接入 feed 层。必需操作和响应结构见 [下载服务 Adapter 契约](downloader-adapter.md)。
 
 ## Feed 阶段
 
@@ -79,9 +93,29 @@ downloader 由用户自行部署和登录。登录态由 downloader 或用户配
 |---|---:|---|
 | `taxonomy` | `finance` | 文章评分使用的分类体系。 |
 | `score_limit` | `0` | 最多评分多少篇文章，`0` 表示全部。 |
-| `min_score` | `0.0` | 保存 rules digest 的最低分数。 |
+| `min_score` | `0.0` | 保存 rules 摘要（digest）的最低分数。 |
 
-当前评分是 `rules_v1`，用于初始保存层级。重要性分数和阈值后续需要结合误收、漏收、存储成本和用户反馈持续调整。
+`rules_v1` 是本地 fallback，用于初始保存层级。agent 工作流可以通过 `mpfeed llm export-jobs` 导出文章任务，再用 `mpfeed llm import-results` 导入 LLM 语义重要性分数；导入后的分数会影响保存层级和正文抓取优先级。LLM 分数分阶段保存：metadata 分用于正文抓取前排序，content 分在正文可用后优先用于最终摘要（digest）和保存层级。重要性分数和阈值后续需要结合误收、漏收、存储成本和用户反馈持续调整。
+
+文章 LLM 任务分阶段处理。
+
+元数据阶段（metadata stage）使用偏召回的正文抓取评分。agent 根据标题研究信号、来源相关性、摘要具体度、后续分析潜力、时效性、证据完整度和噪声惩罚打分。系统根据公式分和确定性的低信号覆盖规则计算正文抓取动作；agent 不再自由返回 `triage_decision`。metadata 分数的目标是避免误杀，而不是做最终投研判断。
+
+正文阶段（content stage）使用最终投研价值评分。agent 应返回摘要评分字段 `digest.score_breakdown`，包括研究含量、策略可复现性、决策价值、时效价值、来源相关性、原创/稀缺性、证据完整度和噪声惩罚。`digest.importance_score` 可以作为 LLM 的综合参考分返回，但导入时会按 `score_breakdown` 公式计算并保存最终分数：
+
+```text
+score =
+  研究含量 * 0.25
++ 决策价值 * 0.15
++ 策略可复现性 * 0.25
++ 时效价值 * 0.10
++ 来源相关性 * 0.10
++ 原创/稀缺性 * 0.10
++ 证据完整度 * 0.05
++ 噪声惩罚
+```
+
+这里的“研究含量”奖励分析深度，不奖励单纯篇幅长、材料多。“决策价值”指对后续研究、风险监控和中期配置思考有明确帮助，不奖励泛泛的启发感，也不要求文章具备即时交易意义。公众号文章天然有一定滞后，评分应更重视研究质量、策略逻辑和框架可复用性。这套评分规则（rubric）需要保持可审阅，后续根据误收、漏收和存储成本继续调整。
 
 ### 正文抓取
 
@@ -96,7 +130,103 @@ downloader 由用户自行部署和登录。登录态由 downloader 或用户配
 | `content_passes` | `3` | 对同一批待抓取文章做几轮 pass。 |
 | `content_pass_cooldown_seconds` | `30.0` | 两轮 pass 之间的等待秒数。 |
 
-正文抓取使用固定队列和多轮 pass。遇到正文接口返回类似 `请 N 秒后重试` 的提示时，会按提示等待后再继续。
+正文抓取使用固定队列和多轮 pass。可抓取文章按重要性分数、保存层级、来源层级和发布时间排序。遇到正文接口返回类似 `请 N 秒后重试` 的提示时，会按提示等待后再继续。
+
+默认保存阈值：
+
+| 分数区间 | 处理方式 |
+|---:|---|
+| `>= 0.75` | `full_archive`：保存正文，并进入本地图片归档队列 |
+| `0.42 - 0.75` | `content`：保存正文、结构和远端图片链接 |
+| `< 0.42` | `metadata`：只保存文章元数据 |
+
+摘要应用层（digest layer）可以再细分：`>= 0.75` 作为 full-archive 重点文章，`0.60 - 0.75` 作为重要日度摘要候选，`0.42 - 0.60` 作为普通跟踪。
+
+正文阶段（content stage）还应返回摘要路由字段 `digest.application_targets`，用于把文章路由到后续应用：
+
+| 应用目标（target） | 用途 |
+|---|---|
+| `daily_digest` | 日度 feed 摘要候选 |
+| `weekly_report` | 周报材料 |
+| `strategy_backlog` | 值得复现或测试的策略/模型思路 |
+| `market_view` | 市场择时、风格、宏观、利率、信用或配置观点 |
+| `industry_tracking` | 行业供需、政策、价格周期或公司跟踪 |
+| `risk_monitoring` | 风险事件、监管变化、压力信号或负面信号 |
+| `source_quality_signal` | 用于评估来源质量的证据 |
+| `ignore` | 不进入用户侧摘要（digest）的低信号文章 |
+
+### 两阶段 LLM 流程
+
+正式 feed 流程拆成几个可审核阶段：
+
+1. 用 `run feed` 刷新文章元数据。
+2. 按发布时间窗口导出元数据阶段（metadata stage）文章任务。
+3. 导入元数据阶段（metadata stage）LLM 结果。系统根据 `score_breakdown` 计算稳定公式分，并把文章更新为 `metadata` 或 `content` 保存层级。
+4. 用慢速、可重试队列抓取 retained 正文。
+5. 对已抓到正文的文章导出正文阶段（content stage）任务。
+6. 导入正文阶段（content stage）LLM 结果，写入最终分数和 `application_targets`。
+7. 按应用目标、分数或分析阶段导出摘要包（digest pack）。
+
+元数据阶段（metadata stage）导出示例：
+
+```bash
+PYTHONPATH=packages/wechat_mp_feed/src python3 -m wechat_mp_feed.cli \
+  --db ./data/mpfeed.sqlite \
+  llm export-jobs \
+  --entity-type article \
+  --article-content-scope metadata \
+  --article-analysis-stage metadata \
+  --article-published-after 2026-05-11T00:00:00+08:00 \
+  --article-published-before 2026-05-17T23:59:59+08:00 \
+  --output ./work/feed/article-metadata-jobs.json
+```
+
+导入元数据阶段（metadata stage）结果后抓取正文：
+
+```bash
+PYTHONPATH=packages/wechat_mp_feed/src python3 -m wechat_mp_feed.cli \
+  --db ./data/mpfeed.sqlite \
+  collect content \
+  --base-url http://127.0.0.1:5001 \
+  --tier all \
+  --limit 0 \
+  --passes 3 \
+  --delay-min 4 \
+  --delay-max 8 \
+  --timeout 45
+```
+
+正文阶段（content stage）导出示例：
+
+```bash
+PYTHONPATH=packages/wechat_mp_feed/src python3 -m wechat_mp_feed.cli \
+  --db ./data/mpfeed.sqlite \
+  llm export-jobs \
+  --entity-type article \
+  --article-content-scope content \
+  --article-analysis-stage content \
+  --article-retention content_or_archive \
+  --article-published-after 2026-05-11T00:00:00+08:00 \
+  --article-published-before 2026-05-17T23:59:59+08:00 \
+  --output ./work/feed/article-content-jobs.json
+```
+
+摘要包（digest pack）导出示例：
+
+```bash
+PYTHONPATH=packages/wechat_mp_feed/src python3 -m wechat_mp_feed.cli \
+  --db ./data/mpfeed.sqlite \
+  export digests \
+  --format markdown \
+  --application-target weekly_report \
+  --analysis-stage content \
+  --min-score 0.6 \
+  --limit 100
+```
+
+### 图片归档
+
+正文阶段（content stage）LLM 评分完成后，可以运行 `mpfeed archive assets`。该命令只缓存 `full_archive` 文章的图片，通过 `article_assets.block_index` 和 `content_ref` 保留图片在正文中的位置。这样普通文章只保留元数据或正文结构，高价值文章才保存本地图片文件。
 
 ## 输出
 

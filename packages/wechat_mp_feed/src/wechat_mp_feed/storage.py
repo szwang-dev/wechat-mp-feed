@@ -116,14 +116,35 @@ CREATE TABLE IF NOT EXISTS classifications (
   created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS source_classification_reviews (
+  id TEXT PRIMARY KEY,
+  source_id TEXT NOT NULL,
+  taxonomy TEXT NOT NULL,
+  category TEXT NOT NULL,
+  source_attribute TEXT,
+  tags TEXT NOT NULL,
+  confidence REAL NOT NULL DEFAULT 0,
+  method TEXT NOT NULL,
+  reason TEXT,
+  taxonomy_suggestions TEXT,
+  status TEXT NOT NULL DEFAULT 'pending',
+  raw_payload TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(source_id) REFERENCES sources(id)
+);
+
 CREATE TABLE IF NOT EXISTS digests (
   id TEXT PRIMARY KEY,
   article_id TEXT NOT NULL,
   summary TEXT NOT NULL,
   key_points TEXT,
   importance_score REAL NOT NULL DEFAULT 0,
+  score_breakdown TEXT,
+  application_targets TEXT,
   reason TEXT,
   model TEXT,
+  analysis_stage TEXT NOT NULL DEFAULT 'content',
   created_at TEXT NOT NULL,
   FOREIGN KEY(article_id) REFERENCES articles(id)
 );
@@ -142,6 +163,7 @@ CREATE INDEX IF NOT EXISTS idx_sources_biz ON sources(biz);
 CREATE INDEX IF NOT EXISTS idx_articles_source_publish_time ON articles(source_id, publish_time);
 CREATE INDEX IF NOT EXISTS idx_source_candidates_import_score ON source_candidates(import_id, score);
 CREATE INDEX IF NOT EXISTS idx_classifications_entity ON classifications(entity_type, entity_id, taxonomy);
+CREATE INDEX IF NOT EXISTS idx_source_classification_reviews_source ON source_classification_reviews(source_id, taxonomy, status);
 CREATE INDEX IF NOT EXISTS idx_digests_article ON digests(article_id);
 """
 
@@ -168,6 +190,30 @@ def article_id_for(url: str) -> str:
 def asset_id_for(article_id: str, url: str) -> str:
     digest = sha1(f"{article_id}:{url}".encode("utf-8")).hexdigest()[:20]
     return f"asset_{digest}"
+
+
+def effective_article_importance_score(conn: sqlite3.Connection, article_id: str) -> float:
+    row = conn.execute(
+        """
+        SELECT importance_score
+        FROM digests
+        WHERE article_id = ?
+        ORDER BY
+          CASE analysis_stage
+            WHEN 'content' THEN 3
+            WHEN 'metadata' THEN 2
+            WHEN 'rules' THEN 1
+            ELSE 0
+          END DESC,
+          created_at DESC,
+          id DESC
+        LIMIT 1
+        """,
+        (article_id,),
+    ).fetchone()
+    if not row:
+        return 0.0
+    return float(row["importance_score"] or 0)
 
 
 class Store:
@@ -612,6 +658,19 @@ class Store:
             )
             return [dict(row) for row in result.fetchall()]
 
+    def get_source(self, source_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            ensure_schema(conn)
+            row = conn.execute(
+                """
+                SELECT id, platform, name, wechat_fakeid, biz, avatar_url, intro, status, tier, source_type, created_at, updated_at
+                FROM sources
+                WHERE id = ?
+                """,
+                (source_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
     def list_collectable_sources(self, tier: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
         where = "WHERE status = 'active'"
         params: list[Any] = []
@@ -732,6 +791,10 @@ class Store:
             )
             return [_decode_row(row, json_fields=("raw_payload",)) for row in result.fetchall()]
 
+    def latest_article_for_source(self, source_id: str) -> dict[str, Any] | None:
+        rows = self.list_articles(limit=1, source_id=source_id)
+        return rows[0] if rows else None
+
     def list_feed_items(
         self,
         limit: int = 100,
@@ -791,6 +854,7 @@ class Store:
                   ) AS asset_count,
                   d.summary AS digest_summary,
                   d.importance_score,
+                  d.analysis_stage AS digest_analysis_stage,
                   d.reason AS digest_reason,
                   d.model AS digest_model
                 FROM articles a
@@ -800,7 +864,15 @@ class Store:
                   SELECT d2.id
                   FROM digests d2
                   WHERE d2.article_id = a.id
-                  ORDER BY d2.created_at DESC, d2.id DESC
+                  ORDER BY
+                    CASE d2.analysis_stage
+                      WHEN 'content' THEN 3
+                      WHEN 'metadata' THEN 2
+                      WHEN 'rules' THEN 1
+                      ELSE 0
+                    END DESC,
+                    d2.created_at DESC,
+                    d2.id DESC
                   LIMIT 1
                 )
                 {where}
@@ -869,12 +941,48 @@ class Store:
             ensure_schema(conn)
             result = conn.execute(
                 f"""
-                SELECT id, source_id, title, url, digest, cover_url, publish_time, crawl_status,
-                       retention_level, archive_status, retention_reason,
-                       raw_payload, created_at, updated_at
-                FROM articles
+                SELECT a.id, a.source_id, a.title, a.url, a.digest, a.cover_url, a.publish_time, a.crawl_status,
+                       a.retention_level, a.archive_status, a.retention_reason,
+                       a.raw_payload, a.created_at, a.updated_at,
+                       COALESCE(d.importance_score, 0) AS importance_score,
+                       d.analysis_stage AS importance_stage
+                FROM articles a
+                LEFT JOIN (
+                    SELECT d1.article_id, d1.importance_score, d1.analysis_stage
+                    FROM digests d1
+                    WHERE d1.id = (
+                        SELECT d2.id
+                        FROM digests d2
+                        WHERE d2.article_id = d1.article_id
+                        ORDER BY
+                          CASE d2.analysis_stage
+                            WHEN 'content' THEN 3
+                            WHEN 'metadata' THEN 2
+                            WHEN 'rules' THEN 1
+                            ELSE 0
+                          END DESC,
+                          d2.created_at DESC,
+                          d2.id DESC
+                        LIMIT 1
+                    )
+                ) d ON d.article_id = a.id
+                LEFT JOIN sources s ON s.id = a.source_id
                 WHERE {' AND '.join(where_parts)}
-                ORDER BY COALESCE(publish_time, created_at) DESC, id DESC
+                ORDER BY
+                    COALESCE(d.importance_score, 0) DESC,
+                    CASE a.retention_level
+                        WHEN 'full_archive' THEN 2
+                        WHEN 'content' THEN 1
+                        ELSE 0
+                    END DESC,
+                    CASE s.tier
+                        WHEN 'core' THEN 3
+                        WHEN 'normal' THEN 2
+                        WHEN 'long_tail' THEN 1
+                        ELSE 0
+                    END DESC,
+                    COALESCE(a.publish_time, a.created_at) DESC,
+                    a.id DESC
                 LIMIT ?
                 """,
                 params,
@@ -967,6 +1075,27 @@ class Store:
             )
             return [_decode_row(row, json_fields=("content_structure",)) for row in result.fetchall()]
 
+    def get_article_content(self, article_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            ensure_schema(conn)
+            row = conn.execute(
+                """
+                SELECT
+                  a.id AS article_id, a.title, a.url, a.source_id, s.name AS source_name,
+                  a.digest, a.cover_url, a.publish_time, a.crawl_status,
+                  a.retention_level, a.archive_status, a.retention_reason,
+                  c.content_html, c.content_text, c.content_markdown, c.content_structure, c.fetch_error, c.extracted_at
+                FROM articles a
+                LEFT JOIN sources s ON s.id = a.source_id
+                LEFT JOIN article_contents c ON c.article_id = a.id
+                WHERE a.id = ?
+                """,
+                (article_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return _decode_row(row, json_fields=("content_structure",))
+
     def list_article_assets(self, article_id: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
         where = ""
         params: list[Any] = []
@@ -989,16 +1118,125 @@ class Store:
             )
             return [_decode_row(row, json_fields=("metadata",)) for row in result.fetchall()]
 
-    def list_articles_with_content(
+    def list_assets_for_archive(self, limit: int = 100, cached: bool = False) -> list[dict[str, Any]]:
+        where_parts = [
+            "a.retention_level = 'full_archive'",
+            "aa.asset_type = 'image'",
+            "aa.url IS NOT NULL",
+        ]
+        if not cached:
+            where_parts.append("COALESCE(aa.download_status, 'url_only') != 'cached'")
+        with self.connect() as conn:
+            ensure_schema(conn)
+            result = conn.execute(
+                f"""
+                SELECT
+                  aa.id, aa.article_id, aa.asset_type, aa.url, aa.block_index, aa.content_ref,
+                  aa.local_path, aa.metadata, aa.download_status, aa.created_at,
+                  a.title AS article_title, a.retention_level, a.archive_status
+                FROM article_assets aa
+                JOIN articles a ON a.id = aa.article_id
+                WHERE {' AND '.join(where_parts)}
+                ORDER BY
+                  COALESCE(a.publish_time, a.created_at) DESC,
+                  aa.article_id,
+                  COALESCE(aa.block_index, 999999),
+                  aa.id
+                LIMIT ?
+                """,
+                (limit,),
+            )
+            return [_decode_row(row, json_fields=("metadata",)) for row in result.fetchall()]
+
+    def update_article_asset_cache(self, asset_id: str, local_path: str | None, download_status: str) -> dict[str, Any]:
+        with self.connect() as conn:
+            ensure_schema(conn)
+            conn.execute(
+                """
+                UPDATE article_assets
+                SET local_path = ?, download_status = ?
+                WHERE id = ?
+                """,
+                (local_path, download_status, asset_id),
+            )
+        return {"ok": True, "asset_id": asset_id, "local_path": local_path, "download_status": download_status}
+
+    def refresh_article_archive_status(self, article_id: str) -> dict[str, Any]:
+        updated_at = now_iso()
+        with self.connect() as conn:
+            ensure_schema(conn)
+            row = conn.execute(
+                """
+                SELECT
+                  count(*) AS total_assets,
+                  sum(CASE WHEN download_status = 'cached' THEN 1 ELSE 0 END) AS cached_assets,
+                  sum(CASE WHEN download_status = 'failed' THEN 1 ELSE 0 END) AS failed_assets
+                FROM article_assets
+                WHERE article_id = ? AND asset_type = 'image'
+                """,
+                (article_id,),
+            ).fetchone()
+            total = int(row["total_assets"] or 0)
+            cached = int(row["cached_assets"] or 0)
+            failed = int(row["failed_assets"] or 0)
+            if total and cached == total:
+                archive_status = "cached"
+            elif failed:
+                archive_status = "failed"
+            else:
+                archive_status = "pending"
+            conn.execute(
+                "UPDATE articles SET archive_status = ?, updated_at = ? WHERE id = ? AND retention_level = 'full_archive'",
+                (archive_status, updated_at, article_id),
+            )
+        return {
+            "ok": True,
+            "article_id": article_id,
+            "archive_status": archive_status,
+            "total_assets": total,
+            "cached_assets": cached,
+            "failed_assets": failed,
+        }
+
+    def list_articles_for_llm(
         self,
         limit: int = 100,
         source_id: str | None = None,
+        content_scope: str = "all",
+        updated_after: str | None = None,
+        published_after: str | None = None,
+        published_before: str | None = None,
+        retention_levels: tuple[str, ...] | None = None,
     ) -> list[dict[str, Any]]:
-        where = ""
+        if content_scope not in {"all", "content", "metadata"}:
+            raise ValueError("content_scope must be one of: all, content, metadata")
+        where_parts = []
         params: list[Any] = []
         if source_id:
-            where = "WHERE a.source_id = ?"
+            where_parts.append("a.source_id = ?")
             params.append(source_id)
+        if updated_after:
+            where_parts.append("a.updated_at >= ?")
+            params.append(updated_after)
+        if published_after:
+            where_parts.append("a.publish_time >= ?")
+            params.append(published_after)
+        if published_before:
+            where_parts.append("a.publish_time <= ?")
+            params.append(published_before)
+        if retention_levels:
+            placeholders = ", ".join("?" for _ in retention_levels)
+            where_parts.append(f"a.retention_level IN ({placeholders})")
+            params.extend(retention_levels)
+        if content_scope == "content":
+            where_parts.append(
+                "(c.content_text IS NOT NULL OR c.content_markdown IS NOT NULL OR c.content_html IS NOT NULL)"
+            )
+        elif content_scope == "metadata":
+            where_parts.append(
+                "(c.content_text IS NULL AND c.content_markdown IS NULL AND c.content_html IS NULL)"
+            )
+        where = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
         params.append(limit)
 
         with self.connect() as conn:
@@ -1036,6 +1274,13 @@ class Store:
                 params,
             )
             return [_decode_row(row, json_fields=("raw_payload", "content_structure")) for row in result.fetchall()]
+
+    def list_articles_with_content(
+        self,
+        limit: int = 100,
+        source_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        return self.list_articles_for_llm(limit=limit, source_id=source_id, content_scope="content")
 
     def save_classification(self, classification: dict[str, Any]) -> dict[str, Any]:
         created_at = now_iso()
@@ -1075,6 +1320,143 @@ class Store:
 
         return {"id": classification_id, "created_at": created_at, **classification}
 
+    def replace_source_classification(self, classification: dict[str, Any]) -> dict[str, Any]:
+        if classification.get("entity_type") != "source":
+            raise ValueError("replace_source_classification only accepts source classifications")
+        created_at = now_iso()
+        classification_id = new_id("cls")
+        with self.connect() as conn:
+            ensure_schema(conn)
+            conn.execute(
+                """
+                DELETE FROM classifications
+                WHERE entity_type = 'source' AND entity_id = ? AND taxonomy = ?
+                """,
+                (
+                    classification["entity_id"],
+                    classification["taxonomy"],
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO classifications
+                  (id, entity_type, entity_id, taxonomy, category, tags, confidence, method, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    classification_id,
+                    classification["entity_type"],
+                    classification["entity_id"],
+                    classification["taxonomy"],
+                    classification["category"],
+                    json.dumps(classification.get("tags") or [], ensure_ascii=False, sort_keys=True),
+                    float(classification.get("confidence") or 0),
+                    classification["method"],
+                    created_at,
+                ),
+            )
+
+        return {"id": classification_id, "created_at": created_at, **classification}
+
+    def save_source_classification_review(self, review: dict[str, Any]) -> dict[str, Any]:
+        created_at = now_iso()
+        review_id = new_id("scr")
+        tags = review.get("tags") or []
+        taxonomy_suggestions = review.get("taxonomy_suggestions") or []
+        with self.connect() as conn:
+            ensure_schema(conn)
+            conn.execute(
+                """
+                DELETE FROM source_classification_reviews
+                WHERE source_id = ? AND taxonomy = ? AND status = 'pending'
+                """,
+                (review["source_id"], review["taxonomy"]),
+            )
+            conn.execute(
+                """
+                INSERT INTO source_classification_reviews
+                  (id, source_id, taxonomy, category, source_attribute, tags, confidence, method,
+                   reason, taxonomy_suggestions, status, raw_payload, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    review_id,
+                    review["source_id"],
+                    review["taxonomy"],
+                    review["category"],
+                    review.get("source_attribute"),
+                    json.dumps(tags, ensure_ascii=False, sort_keys=True),
+                    float(review.get("confidence") or 0),
+                    review["method"],
+                    review.get("reason"),
+                    json.dumps(taxonomy_suggestions, ensure_ascii=False, sort_keys=True),
+                    review.get("status") or "pending",
+                    json.dumps(review.get("raw_payload") or {}, ensure_ascii=False, sort_keys=True),
+                    created_at,
+                    created_at,
+                ),
+            )
+
+        return {"id": review_id, "created_at": created_at, "updated_at": created_at, **review}
+
+    def list_source_classification_reviews(
+        self,
+        limit: int = 100,
+        source_id: str | None = None,
+        status: str | None = "pending",
+    ) -> list[dict[str, Any]]:
+        where_parts = []
+        params: list[Any] = []
+        if source_id:
+            where_parts.append("source_id = ?")
+            params.append(source_id)
+        if status:
+            where_parts.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+        params.append(limit)
+        with self.connect() as conn:
+            ensure_schema(conn)
+            result = conn.execute(
+                f"""
+                SELECT id, source_id, taxonomy, category, source_attribute, tags, confidence, method,
+                       reason, taxonomy_suggestions, status, raw_payload, created_at, updated_at
+                FROM source_classification_reviews
+                {where}
+                ORDER BY updated_at DESC, id DESC
+                LIMIT ?
+                """,
+                params,
+            )
+            return [
+                _decode_row(row, json_fields=("tags", "taxonomy_suggestions", "raw_payload"))
+                for row in result.fetchall()
+            ]
+
+    def update_source_classification_review_status(self, review_id: str, status: str) -> dict[str, Any] | None:
+        updated_at = now_iso()
+        with self.connect() as conn:
+            ensure_schema(conn)
+            row = conn.execute(
+                """
+                SELECT id, source_id, taxonomy, category, source_attribute, tags, confidence, method,
+                       reason, taxonomy_suggestions, status, raw_payload, created_at, updated_at
+                FROM source_classification_reviews
+                WHERE id = ?
+                """,
+                (review_id,),
+            ).fetchone()
+            if not row:
+                return None
+            conn.execute(
+                "UPDATE source_classification_reviews SET status = ?, updated_at = ? WHERE id = ?",
+                (status, updated_at, review_id),
+            )
+            item = _decode_row(row, json_fields=("tags", "taxonomy_suggestions", "raw_payload"))
+            item["status"] = status
+            item["updated_at"] = updated_at
+            return item
+
     def list_classifications(
         self,
         limit: int = 100,
@@ -1109,17 +1491,18 @@ class Store:
     def save_digest(self, digest: dict[str, Any]) -> dict[str, Any]:
         created_at = now_iso()
         digest_id = new_id("dig")
+        analysis_stage = digest.get("analysis_stage") or "content"
         with self.connect() as conn:
             ensure_schema(conn)
             conn.execute(
-                "DELETE FROM digests WHERE article_id = ? AND model = ?",
-                (digest["article_id"], digest.get("model")),
+                "DELETE FROM digests WHERE article_id = ? AND model = ? AND analysis_stage = ?",
+                (digest["article_id"], digest.get("model"), analysis_stage),
             )
             conn.execute(
                 """
                 INSERT INTO digests
-                  (id, article_id, summary, key_points, importance_score, reason, model, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                  (id, article_id, summary, key_points, importance_score, score_breakdown, application_targets, reason, model, analysis_stage, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     digest_id,
@@ -1127,12 +1510,31 @@ class Store:
                     digest["summary"],
                     json.dumps(digest.get("key_points") or [], ensure_ascii=False, sort_keys=True),
                     float(digest.get("importance_score") or 0),
+                    json.dumps(digest.get("score_breakdown") or {}, ensure_ascii=False, sort_keys=True),
+                    json.dumps(digest.get("application_targets") or [], ensure_ascii=False, sort_keys=True),
                     digest.get("reason"),
                     digest.get("model"),
+                    analysis_stage,
                     created_at,
                 ),
             )
-            decision = retention_decision_for_score(float(digest.get("importance_score") or 0))
+            score = effective_article_importance_score(conn, digest["article_id"])
+            article_row = conn.execute(
+                """
+                SELECT a.title, a.digest, s.name AS source_name
+                FROM articles a
+                LEFT JOIN sources s ON s.id = a.source_id
+                WHERE a.id = ?
+                """,
+                (digest["article_id"],),
+            ).fetchone()
+            decision = retention_decision_for_score(
+                score,
+                analysis_stage=analysis_stage,
+                title=article_row["title"] if article_row else None,
+                source_name=article_row["source_name"] if article_row else None,
+                digest=article_row["digest"] if article_row else None,
+            )
             conn.execute(
                 """
                 UPDATE articles
@@ -1151,25 +1553,48 @@ class Store:
                 ),
             )
 
-        return {"id": digest_id, "created_at": created_at, **digest}
+        return {"id": digest_id, "created_at": created_at, "analysis_stage": analysis_stage, **digest}
 
-    def list_digests(self, limit: int = 100) -> list[dict[str, Any]]:
+    def list_digests(
+        self,
+        limit: int = 100,
+        application_target: str | None = None,
+        min_score: float | None = None,
+        analysis_stage: str | None = None,
+    ) -> list[dict[str, Any]]:
+        where_parts = []
+        params: list[Any] = []
+        if application_target:
+            where_parts.append(
+                "EXISTS (SELECT 1 FROM json_each(COALESCE(d.application_targets, '[]')) WHERE value = ?)"
+            )
+            params.append(application_target)
+        if min_score is not None:
+            where_parts.append("d.importance_score >= ?")
+            params.append(float(min_score))
+        if analysis_stage:
+            where_parts.append("d.analysis_stage = ?")
+            params.append(analysis_stage)
+        where = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+        params.append(limit)
         with self.connect() as conn:
             ensure_schema(conn)
             result = conn.execute(
-                """
+                f"""
                 SELECT
                   d.id, d.article_id, a.source_id, s.name AS source_name, a.title, a.url, a.publish_time,
-                  d.summary, d.key_points, d.importance_score, d.reason, d.model, d.created_at
+                  d.summary, d.key_points, d.importance_score, d.score_breakdown, d.application_targets,
+                  d.reason, d.model, d.analysis_stage, d.created_at
                 FROM digests d
                 JOIN articles a ON a.id = d.article_id
                 LEFT JOIN sources s ON s.id = a.source_id
+                {where}
                 ORDER BY d.importance_score DESC, COALESCE(a.publish_time, d.created_at) DESC, d.id DESC
                 LIMIT ?
                 """,
-                (limit,),
+                params,
             )
-            return [_decode_row(row, json_fields=("key_points",)) for row in result.fetchall()]
+            return [_decode_row(row, json_fields=("key_points", "score_breakdown", "application_targets")) for row in result.fetchall()]
 
     def list_imports(
         self,
@@ -1290,6 +1715,13 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE articles ADD COLUMN archive_status TEXT NOT NULL DEFAULT 'not_requested'")
     if "retention_reason" not in article_columns:
         conn.execute("ALTER TABLE articles ADD COLUMN retention_reason TEXT")
+    digest_columns = {row["name"] for row in conn.execute("PRAGMA table_info(digests)").fetchall()}
+    if "analysis_stage" not in digest_columns:
+        conn.execute("ALTER TABLE digests ADD COLUMN analysis_stage TEXT NOT NULL DEFAULT 'content'")
+    if "score_breakdown" not in digest_columns:
+        conn.execute("ALTER TABLE digests ADD COLUMN score_breakdown TEXT")
+    if "application_targets" not in digest_columns:
+        conn.execute("ALTER TABLE digests ADD COLUMN application_targets TEXT")
 
 
 def asset_block_indexes(content_structure: list[dict[str, Any]]) -> dict[str, int]:

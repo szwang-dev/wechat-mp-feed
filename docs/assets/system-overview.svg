@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="460" viewBox="0 0 1120 460" role="img" aria-labelledby="title desc">
-  <title id="title">wechat-mp-feed system overview</title>
-  <desc id="desc">Agent-first workflow connecting users, AI agents, the mpfeed CLI, a local SQLite store, a user-operated downloader, WeChat Official Accounts, and finance feed outputs.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="500" viewBox="0 0 1120 500" role="img" aria-labelledby="title desc">
+  <title id="title">wechat-mp-feed layered structure</title>
+  <desc id="desc">Shows the feed foundation layer, semantic configuration layer, and application output layer.</desc>
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
       <path d="M 1 1 L 9 5 L 1 9" fill="none" stroke="#24292f" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
@@ -11,80 +11,95 @@
     <style>
       .bg { fill: #fffdf8; }
       .title { font: 700 28px "Inter", "Segoe UI", sans-serif; fill: #1f2328; }
-      .label { font: 700 19px "Inter", "Segoe UI", sans-serif; fill: #1f2328; }
+      .subtitle { font: 500 15px "Inter", "Segoe UI", sans-serif; fill: #57606a; }
+      .layerTitle { font: 800 22px "Inter", "Segoe UI", sans-serif; fill: #1f2328; }
+      .label { font: 700 16px "Inter", "Segoe UI", sans-serif; fill: #1f2328; }
       .small { font: 500 13px "Inter", "Segoe UI", sans-serif; fill: #57606a; }
-      .box { stroke: #24292f; stroke-width: 2.4; filter: url(#shadow); }
-      .rough { fill: none; stroke: #24292f; stroke-width: 1.2; opacity: .55; }
-      .arrow { fill: none; stroke: #24292f; stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; marker-end: url(#arrow); }
-      .slogan { font: 800 18px "Inter", "Segoe UI", sans-serif; fill: #6e4f00; }
+      .band { stroke: #24292f; stroke-width: 2.4; filter: url(#shadow); }
+      .box { stroke: #24292f; stroke-width: 1.8; }
+      .rough { fill: none; stroke: #24292f; stroke-width: 1.1; opacity: .50; }
+      .arrow { fill: none; stroke: #24292f; stroke-width: 2.1; stroke-linecap: round; stroke-linejoin: round; marker-end: url(#arrow); }
+      .note { font: 700 15px "Inter", "Segoe UI", sans-serif; fill: #6e4f00; }
     </style>
   </defs>
-  <rect class="bg" width="1120" height="460" rx="24"/>
-  <text x="54" y="58" class="title">Agent-first feed infrastructure</text>
-  <text x="54" y="434" class="slogan">local · reviewable · finance-ready</text>
 
-  <g transform="translate(54 132)">
-    <rect class="box" x="0" y="0" width="154" height="92" rx="20" fill="#dff7ef"/>
-    <path class="rough" d="M8 8 C44 2,102 4,145 10 M148 20 C152 46,151 68,145 84 M137 89 C96 94,47 93,10 86 M5 72 C1 45,2 21,9 8"/>
-    <text x="77" y="40" text-anchor="middle" class="label">User</text>
-    <text x="77" y="64" text-anchor="middle" class="small">review + auth</text>
+  <rect class="bg" width="1120" height="500" rx="24"/>
+  <text x="54" y="56" class="title">Three layers: feed foundation + semantic configuration + application outputs</text>
+  <text x="54" y="84" class="subtitle">Finance research is the built-in domain pack. Taxonomy, tags, scoring rules, and targets can be adapted or replaced.</text>
+
+  <g transform="translate(54 122)">
+    <rect class="band" x="0" y="0" width="1012" height="96" rx="22" fill="#e8f1ff"/>
+    <path class="rough" d="M12 10 C240 0,760 4,1000 12 M1006 28 C1015 56,1012 78,999 88 M990 93 C744 103,260 99,13 88 M6 76 C-2 46,2 22,12 10"/>
+    <text x="28" y="38" class="layerTitle">Feed foundation</text>
+    <text x="28" y="66" class="small">Ingestion and persistence</text>
+
+    <g transform="translate(260 23)">
+      <rect class="box" x="0" y="0" width="142" height="50" rx="14" fill="#ffffff"/>
+      <text x="71" y="31" text-anchor="middle" class="label">Sources</text>
+    </g>
+    <g transform="translate(430 23)">
+      <rect class="box" x="0" y="0" width="142" height="50" rx="14" fill="#ffffff"/>
+      <text x="71" y="31" text-anchor="middle" class="label">Metadata</text>
+    </g>
+    <g transform="translate(600 23)">
+      <rect class="box" x="0" y="0" width="142" height="50" rx="14" fill="#ffffff"/>
+      <text x="71" y="31" text-anchor="middle" class="label">Content</text>
+    </g>
+    <g transform="translate(770 23)">
+      <rect class="box" x="0" y="0" width="142" height="50" rx="14" fill="#ffffff"/>
+      <text x="71" y="31" text-anchor="middle" class="label">SQLite</text>
+    </g>
   </g>
 
-  <g transform="translate(260 132)">
-    <rect class="box" x="0" y="0" width="174" height="92" rx="20" fill="#e8f1ff"/>
-    <path class="rough" d="M9 9 C48 3,126 3,165 10 M169 22 C174 47,172 72,165 84 M152 89 C108 94,55 93,9 85 M5 70 C0 45,3 20,9 9"/>
-    <text x="87" y="38" text-anchor="middle" class="label">AI Agent</text>
-    <text x="87" y="63" text-anchor="middle" class="small">Skill-guided operator</text>
+  <g transform="translate(54 246)">
+    <rect class="band" x="0" y="0" width="1012" height="96" rx="22" fill="#fff1e5"/>
+    <path class="rough" d="M12 9 C248 1,764 2,1001 11 M1006 27 C1016 54,1011 78,998 88 M989 93 C748 101,262 99,13 88 M7 77 C-1 48,3 21,12 9"/>
+    <text x="28" y="38" class="layerTitle">Semantic configuration</text>
+    <text x="28" y="66" class="small">Rules for source and article value</text>
+
+    <g transform="translate(260 23)">
+      <rect class="box" x="0" y="0" width="142" height="50" rx="14" fill="#ffffff"/>
+      <text x="71" y="31" text-anchor="middle" class="label">Taxonomy</text>
+    </g>
+    <g transform="translate(430 23)">
+      <rect class="box" x="0" y="0" width="142" height="50" rx="14" fill="#ffffff"/>
+      <text x="71" y="31" text-anchor="middle" class="label">Tags</text>
+    </g>
+    <g transform="translate(600 23)">
+      <rect class="box" x="0" y="0" width="142" height="50" rx="14" fill="#ffffff"/>
+      <text x="71" y="31" text-anchor="middle" class="label">Scoring</text>
+    </g>
+    <g transform="translate(770 23)">
+      <rect class="box" x="0" y="0" width="142" height="50" rx="14" fill="#ffffff"/>
+      <text x="71" y="31" text-anchor="middle" class="label">LLM jobs</text>
+    </g>
   </g>
 
-  <g transform="translate(500 132)">
-    <rect class="box" x="0" y="0" width="156" height="92" rx="20" fill="#fff1e5"/>
-    <path class="rough" d="M8 10 C48 2,109 4,149 8 M151 21 C157 49,154 69,148 85 M140 90 C98 94,49 91,9 86 M6 72 C1 42,3 22,8 10"/>
-    <text x="78" y="39" text-anchor="middle" class="label">mpfeed CLI</text>
-    <text x="78" y="64" text-anchor="middle" class="small">workflow commands</text>
+  <g transform="translate(54 370)">
+    <rect class="band" x="0" y="0" width="1012" height="86" rx="22" fill="#e6ffec"/>
+    <path class="rough" d="M12 9 C248 1,764 2,1001 11 M1006 26 C1015 51,1010 70,998 78 M989 84 C748 91,262 88,13 78 M7 68 C-1 43,3 20,12 9"/>
+    <text x="28" y="36" class="layerTitle">Application outputs</text>
+    <text x="28" y="63" class="small">Downstream workflow results</text>
+
+    <g transform="translate(260 18)">
+      <rect class="box" x="0" y="0" width="150" height="50" rx="14" fill="#ffffff"/>
+      <text x="75" y="31" text-anchor="middle" class="label">Digest packs</text>
+    </g>
+    <g transform="translate(438 18)">
+      <rect class="box" x="0" y="0" width="150" height="50" rx="14" fill="#ffffff"/>
+      <text x="75" y="31" text-anchor="middle" class="label">Context</text>
+    </g>
+    <g transform="translate(616 18)">
+      <rect class="box" x="0" y="0" width="150" height="50" rx="14" fill="#ffffff"/>
+      <text x="75" y="31" text-anchor="middle" class="label">Reports</text>
+    </g>
+    <g transform="translate(794 18)">
+      <rect class="box" x="0" y="0" width="150" height="50" rx="14" fill="#ffffff"/>
+      <text x="75" y="31" text-anchor="middle" class="label">Backlogs</text>
+    </g>
   </g>
 
-  <g transform="translate(748 82)">
-    <rect class="box" x="0" y="0" width="188" height="90" rx="20" fill="#f6f8fa"/>
-    <path class="rough" d="M9 8 C52 2,132 4,180 10 M184 21 C190 47,188 68,180 82 M166 87 C120 92,61 91,11 84 M5 68 C1 44,2 19,9 8"/>
-    <text x="94" y="36" text-anchor="middle" class="label">Local SQLite</text>
-    <text x="94" y="61" text-anchor="middle" class="small">sources + articles + content</text>
-  </g>
-
-  <g transform="translate(748 224)">
-    <rect class="box" x="0" y="0" width="188" height="94" rx="20" fill="#fbefff"/>
-    <path class="rough" d="M10 9 C50 3,130 3,181 9 M184 22 C190 52,188 74,179 86 M166 91 C121 96,59 93,10 86 M4 71 C1 45,3 21,10 9"/>
-    <text x="94" y="35" text-anchor="middle" class="label">Downloader</text>
-    <text x="94" y="60" text-anchor="middle" class="small">user-operated service</text>
-  </g>
-
-  <g transform="translate(972 224)">
-    <rect class="box" x="0" y="0" width="104" height="94" rx="20" fill="#ffeef0"/>
-    <path class="rough" d="M8 9 C36 3,72 3,98 10 M101 25 C106 52,104 73,96 87 M85 91 C60 96,32 93,8 85 M4 70 C1 43,2 21,8 9"/>
-    <text x="52" y="36" text-anchor="middle" class="label">WeChat</text>
-    <text x="52" y="61" text-anchor="middle" class="small">Official Accounts</text>
-  </g>
-
-  <g transform="translate(500 318)">
-    <rect class="box" x="0" y="0" width="156" height="84" rx="20" fill="#e6ffec"/>
-    <path class="rough" d="M9 8 C43 2,111 3,149 9 M151 22 C157 48,154 66,147 77 M136 82 C95 87,49 85,9 78 M5 64 C1 39,3 19,9 8"/>
-    <text x="78" y="34" text-anchor="middle" class="label">Feed exports</text>
-    <text x="78" y="58" text-anchor="middle" class="small">CSV / JSON jobs</text>
-  </g>
-
-  <g transform="translate(748 350)">
-    <rect class="box" x="0" y="0" width="188" height="70" rx="20" fill="#fff8c5"/>
-    <path class="rough" d="M10 8 C51 3,136 3,181 9 M184 21 C189 42,186 58,178 64 M166 69 C116 72,61 71,10 64 M5 54 C1 33,3 18,10 8"/>
-    <text x="94" y="31" text-anchor="middle" class="label">Finance outputs</text>
-    <text x="94" y="53" text-anchor="middle" class="small">inbox / digest / research</text>
-  </g>
-
-  <path class="arrow" d="M210 178 C226 175,238 175,254 178"/>
-  <path class="arrow" d="M440 178 C458 175,475 175,494 178"/>
-  <path class="arrow" d="M660 166 C692 132,715 123,742 126"/>
-  <path class="arrow" d="M660 196 C695 235,714 263,742 270"/>
-  <path class="arrow" d="M940 270 C951 269,958 269,966 270"/>
-  <path class="arrow" d="M500 210 C470 248,470 315,494 356"/>
-  <path class="arrow" d="M660 360 C693 369,715 377,742 384"/>
-  <path class="arrow" d="M846 224 C849 207,850 190,846 176"/>
+  <path class="arrow" d="M560 222 C560 229,560 235,560 242"/>
+  <path class="arrow" d="M560 346 C560 353,560 360,560 366"/>
+  <text x="824" y="88" class="note">Built in: finance research pack</text>
 </svg>

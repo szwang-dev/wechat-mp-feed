@@ -5,12 +5,14 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import random
 import re
 import sys
 import time
 import zipfile
 from collections.abc import Sequence
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urljoin
 from xml.etree import ElementTree as ET
@@ -18,6 +20,7 @@ from xml.etree import ElementTree as ET
 from .adapters.wechat_download_api import WeChatDownloadAPIAdapter, WeChatDownloadAPIConfig
 from .analysis import classify_article, classify_source, generate_article_digest
 from .articles import normalize_article_items
+from .assets import cache_full_archive_assets
 from .candidates import normalize_source_candidates
 from .content import normalize_article_content
 from .llm_jobs import apply_llm_results, build_llm_jobs, build_onboarding_llm_jobs
@@ -188,7 +191,26 @@ def build_parser() -> argparse.ArgumentParser:
     export_digests.add_argument("--db", default=argparse.SUPPRESS, help="SQLite database path.")
     export_digests.add_argument("--format", choices=("json", "csv", "markdown"), default="json")
     export_digests.add_argument("--limit", type=int, default=100)
+    export_digests.add_argument("--application-target", help="Filter by digest.application_targets id, such as weekly_report.")
+    export_digests.add_argument("--min-score", type=float, help="Filter by minimum stored importance score.")
+    export_digests.add_argument("--analysis-stage", choices=("metadata", "content", "rules"), help="Filter by digest analysis stage.")
     export_digests.set_defaults(func=cmd_export_digests)
+
+    export_digest_context = export_subcommands.add_parser(
+        "digest-context",
+        help="Export digest rows with full article content and image asset context for downstream application digests.",
+    )
+    export_digest_context.add_argument("--db", default=argparse.SUPPRESS, help="SQLite database path.")
+    export_digest_context.add_argument("--format", choices=("json", "jsonl", "markdown"), default="json")
+    export_digest_context.add_argument("--limit", type=int, default=100)
+    export_digest_context.add_argument("--application-target", help="Filter by digest.application_targets id, such as weekly_report.")
+    export_digest_context.add_argument("--min-score", type=float, help="Filter by minimum stored importance score.")
+    export_digest_context.add_argument("--analysis-stage", choices=("metadata", "content", "rules"), help="Filter by digest analysis stage.")
+    export_digest_context.add_argument("--max-content-chars", type=int, default=0, help="Truncate text/markdown/html fields. Use 0 for full content.")
+    export_digest_context.add_argument("--include-html", action="store_true", help="Include content_html in exported context.")
+    export_digest_context.add_argument("--no-assets", action="store_true", help="Do not include article_assets rows.")
+    export_digest_context.add_argument("--require-content", action="store_true", help="Only export rows with fetched article content.")
+    export_digest_context.set_defaults(func=cmd_export_digest_context)
 
     resolve_parser = subcommands.add_parser("resolve", help="Resolve imported source names into candidates.")
     resolve_subcommands = resolve_parser.add_subparsers(dest="resolve_command", required=True)
@@ -335,6 +357,30 @@ def build_parser() -> argparse.ArgumentParser:
     collect_latest.add_argument("--no-delay", action="store_true", help="Disable inter-source delay for local testing.")
     collect_latest.set_defaults(func=cmd_collect_latest)
 
+    collect_history = collect_subcommands.add_parser(
+        "history",
+        help="Backfill recent article metadata for active sources by paging the downloader article list.",
+    )
+    collect_history.add_argument("--db", default=argparse.SUPPRESS, help="SQLite database path.")
+    collect_history.add_argument("--base-url", help="Service base URL. Defaults to WECHAT_DOWNLOAD_API_BASE_URL.")
+    collect_history.add_argument("--timeout", type=float, default=30, help="HTTP timeout in seconds.")
+    collect_history.add_argument("--days", type=int, default=90, help="Backfill articles newer than this many days.")
+    collect_history.add_argument("--tier", choices=("all", "core", "normal", "long_tail"), default="all")
+    collect_history.add_argument("--source-offset", type=int, default=0, help="Start offset in the active source list.")
+    collect_history.add_argument("--max-sources", type=int, default=20, help="Max sources in this batch. Use 0 for all after offset.")
+    collect_history.add_argument("--source-name", help="Optional exact source name filter for repair runs.")
+    collect_history.add_argument("--count", type=int, default=100, help="Downloader page size. The current downloader supports up to 100.")
+    collect_history.add_argument("--max-pages-per-source", type=int, default=20, help="Safety cap per source.")
+    collect_history.add_argument("--delay-min", type=float, default=2.5)
+    collect_history.add_argument("--delay-max", type=float, default=6.0)
+    collect_history.add_argument("--page-delay-min", type=float, default=1.5)
+    collect_history.add_argument("--page-delay-max", type=float, default=3.5)
+    collect_history.add_argument("--retries", type=int, default=2)
+    collect_history.add_argument("--backoff-seconds", type=float, default=8.0)
+    collect_history.add_argument("--dry-run", action="store_true", help="Fetch and report without saving articles.")
+    collect_history.add_argument("--no-delay", action="store_true", help="Disable source/page delays for local testing.")
+    collect_history.set_defaults(func=cmd_collect_history)
+
     collect_content = collect_subcommands.add_parser("content", help="Fetch content for collected articles.")
     collect_content.add_argument("--db", default=argparse.SUPPRESS, help="SQLite database path.")
     collect_content.add_argument("--base-url", help="Service base URL. Defaults to WECHAT_DOWNLOAD_API_BASE_URL.")
@@ -347,6 +393,7 @@ def build_parser() -> argparse.ArgumentParser:
     collect_content.add_argument("--backoff-seconds", type=float)
     collect_content.add_argument("--passes", type=int, default=1, help="How many internal passes to run over the same content queue.")
     collect_content.add_argument("--pass-cooldown-seconds", type=float, default=0.0, help="Cooldown between content passes.")
+    collect_content.add_argument("--progress-every", type=int, default=10, help="Emit content-fetch progress every N articles.")
     collect_content.add_argument("--no-delay", action="store_true", help="Disable inter-article delay for local testing.")
     collect_content.set_defaults(func=cmd_collect_content)
 
@@ -397,6 +444,55 @@ def build_parser() -> argparse.ArgumentParser:
     classify_articles.add_argument("--source-id")
     classify_articles.set_defaults(func=cmd_classify_articles)
 
+    source_parser = subcommands.add_parser("source", help="Agent-safe source status, taxonomy, classification, and refresh helpers.")
+    source_subcommands = source_parser.add_subparsers(dest="source_command", required=True)
+
+    source_status = source_subcommands.add_parser("status", help="Return a source snapshot without writing to the database.")
+    source_status.add_argument("--db", default=argparse.SUPPRESS, help="SQLite database path.")
+    source_status.add_argument("--name", default="")
+    source_status.add_argument("--source-id", default="")
+    source_status.add_argument("--biz", default="")
+    source_status.add_argument("--taxonomy", default="finance")
+    source_status.set_defaults(func=cmd_source_status)
+
+    source_set_status = source_subcommands.add_parser("set-status", help="Set a source status through an agent-safe write path.")
+    source_set_status.add_argument("--db", default=argparse.SUPPRESS, help="SQLite database path.")
+    source_set_status.add_argument("--name", default="")
+    source_set_status.add_argument("--source-id", default="")
+    source_set_status.add_argument("--biz", default="")
+    source_set_status.add_argument("--status", choices=("active", "inactive", "archived", "needs_review"), required=True)
+    source_set_status.set_defaults(func=cmd_source_set_status)
+
+    source_taxonomy = source_subcommands.add_parser("taxonomy", help="Return allowed source categories, attributes, and tags.")
+    source_taxonomy.add_argument("--taxonomy", default="finance")
+    source_taxonomy.set_defaults(func=cmd_source_taxonomy)
+
+    source_confirm = source_subcommands.add_parser("confirm-classification", help="Validate and persist a user-confirmed source classification.")
+    source_confirm.add_argument("--db", default=argparse.SUPPRESS, help="SQLite database path.")
+    source_confirm.add_argument("--name", default="")
+    source_confirm.add_argument("--source-id", default="")
+    source_confirm.add_argument("--biz", default="")
+    source_confirm.add_argument("--taxonomy", default="finance")
+    source_confirm.add_argument("--category", required=True)
+    source_confirm.add_argument("--source-attribute", default="")
+    source_confirm.add_argument("--tags", default="", help="Comma-separated tag ids.")
+    source_confirm.add_argument("--confidence", type=float, default=0.7)
+    source_confirm.add_argument("--method", default="manual:agent_confirmed")
+    source_confirm.add_argument("--review-id", default="", help="Optional pending source classification review id to mark confirmed.")
+    source_confirm.set_defaults(func=cmd_source_confirm_classification)
+
+    source_refresh = source_subcommands.add_parser("refresh-latest", help="Refresh latest article metadata for one active source.")
+    source_refresh.add_argument("--db", default=argparse.SUPPRESS, help="SQLite database path.")
+    source_refresh.add_argument("--base-url", help="Service base URL. Defaults to WECHAT_DOWNLOAD_API_BASE_URL.")
+    source_refresh.add_argument("--timeout", type=float, default=30)
+    source_refresh.add_argument("--name", default="")
+    source_refresh.add_argument("--source-id", default="")
+    source_refresh.add_argument("--biz", default="")
+    source_refresh.add_argument("--count", type=int, default=5)
+    source_refresh.add_argument("--retries", type=int, default=2)
+    source_refresh.add_argument("--backoff-seconds", type=float, default=3.0)
+    source_refresh.set_defaults(func=cmd_source_refresh_latest)
+
     digest_parser = subcommands.add_parser("digest", help="Generate reviewable article digests.")
     digest_subcommands = digest_parser.add_subparsers(dest="digest_command", required=True)
 
@@ -408,6 +504,17 @@ def build_parser() -> argparse.ArgumentParser:
     digest_articles.add_argument("--min-score", type=float, default=0.0)
     digest_articles.set_defaults(func=cmd_digest_articles)
 
+    archive_parser = subcommands.add_parser("archive", help="Archive retained article assets.")
+    archive_subcommands = archive_parser.add_subparsers(dest="archive_command", required=True)
+
+    archive_assets = archive_subcommands.add_parser("assets", help="Cache image assets for full_archive articles.")
+    archive_assets.add_argument("--db", default=argparse.SUPPRESS, help="SQLite database path.")
+    archive_assets.add_argument("--output-dir", default="work/archive/assets")
+    archive_assets.add_argument("--limit", type=int, default=100)
+    archive_assets.add_argument("--timeout", type=float, default=30.0)
+    archive_assets.add_argument("--overwrite", action="store_true")
+    archive_assets.set_defaults(func=cmd_archive_assets)
+
     llm_parser = subcommands.add_parser("llm", help="Export/import agent-agnostic LLM analysis jobs.")
     llm_subcommands = llm_parser.add_subparsers(dest="llm_command", required=True)
 
@@ -418,6 +525,22 @@ def build_parser() -> argparse.ArgumentParser:
     llm_export.add_argument("--limit", type=int, default=100)
     llm_export.add_argument("--source-id")
     llm_export.add_argument("--content-chars", type=int, default=6000)
+    llm_export.add_argument("--source-article-limit", type=int, default=5)
+    llm_export.add_argument("--article-content-scope", choices=("content", "metadata", "all"), default="content")
+    llm_export.add_argument("--article-updated-after", help="Export only article jobs whose article.updated_at is at or after this ISO timestamp.")
+    llm_export.add_argument("--article-published-after", help="Export only article jobs whose publish_time is at or after this ISO timestamp.")
+    llm_export.add_argument("--article-published-before", help="Export only article jobs whose publish_time is at or before this ISO timestamp.")
+    llm_export.add_argument(
+        "--article-retention",
+        choices=("metadata", "content", "full_archive", "content_or_archive", "all"),
+        default="all",
+        help="Filter article jobs by retention level.",
+    )
+    llm_export.add_argument(
+        "--article-analysis-stage",
+        choices=("metadata", "content"),
+        help="Declare the expected article LLM stage. Defaults to metadata for metadata scope, otherwise content.",
+    )
     llm_export.add_argument("--output", help="Optional JSON output path. Defaults to stdout.")
     llm_export.set_defaults(func=cmd_llm_export_jobs)
 
@@ -482,6 +605,41 @@ def build_parser() -> argparse.ArgumentParser:
     run_agent_smoke.add_argument("--content-chars", type=int, default=2500)
     run_agent_smoke.set_defaults(func=cmd_run_agent_smoke)
 
+    run_llm_feed = run_subcommands.add_parser(
+        "llm-feed",
+        help="Prepare and advance the two-stage LLM feed workflow.",
+    )
+    run_llm_feed.add_argument("--db", default=argparse.SUPPRESS, help="SQLite database path.")
+    run_llm_feed.add_argument("--taxonomy", default="finance")
+    run_llm_feed.add_argument("--work-dir", default="work/feed-llm")
+    run_llm_feed.add_argument("--limit", type=int, default=0, help="Maximum article jobs per stage. Use 0 for all matching articles.")
+    run_llm_feed.add_argument("--published-after", help="Article publish_time lower bound for both LLM stages.")
+    run_llm_feed.add_argument("--published-before", help="Article publish_time upper bound for both LLM stages.")
+    run_llm_feed.add_argument("--metadata-results", help="Optional metadata-stage LLM results to import before content fetch.")
+    run_llm_feed.add_argument("--content-results", help="Optional content-stage LLM results to import before digest-pack export.")
+    run_llm_feed.add_argument("--model", default="llm:agent")
+    run_llm_feed.add_argument("--content-chars", type=int, default=6000)
+    run_llm_feed.add_argument("--fetch-content", action="store_true", help="Fetch retained content after metadata results are imported.")
+    run_llm_feed.add_argument("--base-url", help="Service base URL. Defaults to WECHAT_DOWNLOAD_API_BASE_URL.")
+    run_llm_feed.add_argument("--timeout", type=float, default=45, help="HTTP timeout in seconds for content fetches.")
+    run_llm_feed.add_argument("--content-limit", type=int, default=0, help="Retained article count to fetch. Use 0 for all matching articles.")
+    run_llm_feed.add_argument(
+        "--content-retention",
+        choices=("content_or_archive", "content", "full_archive", "all"),
+        default="content_or_archive",
+        help="Which retention tier is eligible for content fetching.",
+    )
+    run_llm_feed.add_argument("--content-retries", type=int, default=2)
+    run_llm_feed.add_argument("--content-backoff-seconds", type=float, default=5.0)
+    run_llm_feed.add_argument("--content-delay-min", type=float, default=4.0)
+    run_llm_feed.add_argument("--content-delay-max", type=float, default=8.0)
+    run_llm_feed.add_argument("--content-passes", type=int, default=3)
+    run_llm_feed.add_argument("--content-pass-cooldown-seconds", type=float, default=30.0)
+    run_llm_feed.add_argument("--progress-every", type=int, default=20)
+    run_llm_feed.add_argument("--digest-min-score", type=float, default=0.6)
+    run_llm_feed.add_argument("--no-delay", action="store_true", help="Disable delays for local testing.")
+    run_llm_feed.set_defaults(func=cmd_run_llm_feed)
+
     run_onboarding = run_subcommands.add_parser(
         "onboarding",
         help="Run first-run account onboarding: import, multi-round search, evidence probe, and review exports.",
@@ -536,10 +694,30 @@ def build_parser() -> argparse.ArgumentParser:
     run_feed.add_argument("--max-sources", type=int, default=0, help="Maximum active sources to refresh. Use 0 for all active sources.")
     run_feed.add_argument("--count", type=int, default=5, help="Article count to request per source.")
     run_feed.add_argument("--begin", type=int, default=0)
+    run_feed.add_argument(
+        "--refresh-mode",
+        choices=("latest", "incremental"),
+        default="latest",
+        help="Use latest for one page per source, or incremental to page until the latest known article is reached.",
+    )
+    run_feed.add_argument(
+        "--incremental-max-pages",
+        type=int,
+        default=4,
+        help="Safety cap for incremental refresh pages per source.",
+    )
+    run_feed.add_argument("--incremental-page-delay-min", type=float, default=1.0)
+    run_feed.add_argument("--incremental-page-delay-max", type=float, default=2.0)
     run_feed.add_argument("--retries", type=int, default=2)
     run_feed.add_argument("--backoff-seconds", type=float, default=3.0)
     run_feed.add_argument("--delay-min", type=float, default=1.0)
     run_feed.add_argument("--delay-max", type=float, default=3.0)
+    run_feed.add_argument(
+        "--progress-every",
+        type=int,
+        default=10,
+        help="Emit refresh progress every N sources. Use 0 to disable periodic progress.",
+    )
     run_feed.add_argument("--feed-limit", type=int, default=3000)
     run_feed.add_argument("--work-dir", default="work/feed")
     run_feed.add_argument("--feed-output", help="Output path for feed items. Defaults to <work-dir>/feed-items.<format>.")
@@ -618,10 +796,15 @@ RUN_FEED_CONFIG_FLAGS = {
     "max_sources": ("--max-sources",),
     "count": ("--count",),
     "begin": ("--begin",),
+    "refresh_mode": ("--refresh-mode",),
+    "incremental_max_pages": ("--incremental-max-pages",),
+    "incremental_page_delay_min": ("--incremental-page-delay-min",),
+    "incremental_page_delay_max": ("--incremental-page-delay-max",),
     "retries": ("--retries",),
     "backoff_seconds": ("--backoff-seconds",),
     "delay_min": ("--delay-min",),
     "delay_max": ("--delay-max",),
+    "progress_every": ("--progress-every",),
     "feed_limit": ("--feed-limit",),
     "work_dir": ("--work-dir",),
     "feed_output": ("--feed-output",),
@@ -1433,7 +1616,12 @@ def cmd_export_classifications(args: argparse.Namespace) -> int:
 
 def cmd_export_digests(args: argparse.Namespace) -> int:
     store = get_store(args)
-    rows = store.list_digests(limit=args.limit)
+    rows = store.list_digests(
+        limit=args.limit,
+        application_target=args.application_target,
+        min_score=args.min_score,
+        analysis_stage=args.analysis_stage,
+    )
 
     if args.format == "json":
         write_json(rows)
@@ -1453,6 +1641,8 @@ def cmd_export_digests(args: argparse.Namespace) -> int:
         "summary",
         "key_points",
         "importance_score",
+        "application_targets",
+        "analysis_stage",
         "reason",
         "model",
         "created_at",
@@ -1460,7 +1650,39 @@ def cmd_export_digests(args: argparse.Namespace) -> int:
     writer = csv.DictWriter(sys.stdout, fieldnames=fieldnames)
     writer.writeheader()
     for row in rows:
-        writer.writerow({**row, "key_points": json.dumps(row["key_points"], ensure_ascii=False, sort_keys=True)})
+        writer.writerow(
+            {
+                **row,
+                "key_points": json.dumps(row["key_points"], ensure_ascii=False, sort_keys=True),
+                "application_targets": json.dumps(row.get("application_targets") or [], ensure_ascii=False, sort_keys=True),
+            }
+        )
+    return 0
+
+
+def cmd_export_digest_context(args: argparse.Namespace) -> int:
+    store = get_store(args)
+    rows = build_digest_context_rows(
+        store=store,
+        limit=args.limit,
+        application_target=args.application_target,
+        min_score=args.min_score,
+        analysis_stage=args.analysis_stage,
+        include_html=args.include_html,
+        include_assets=not args.no_assets,
+        require_content=args.require_content,
+        max_content_chars=args.max_content_chars,
+    )
+
+    if args.format == "json":
+        write_json(rows)
+        return 0
+    if args.format == "jsonl":
+        for row in rows:
+            print(json.dumps(row, ensure_ascii=False, sort_keys=True))
+        return 0
+
+    print(format_digest_context_markdown(rows))
     return 0
 
 
@@ -2195,6 +2417,258 @@ def cmd_collect_latest(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_collect_history(args: argparse.Namespace) -> int:
+    store = get_store(args)
+    adapter = get_wechat_download_api(args)
+    store.init()
+
+    tier = None if args.tier == "all" else args.tier
+    all_sources = store.list_collectable_sources(tier=tier, limit=100_000)
+    if args.source_name:
+        all_sources = [source for source in all_sources if source["name"] == args.source_name]
+    sources = all_sources[max(0, args.source_offset) :]
+    if args.max_sources > 0:
+        sources = sources[: args.max_sources]
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=args.days)
+    totals = {
+        "sources_seen": len(sources),
+        "sources_ok": 0,
+        "sources_failed": 0,
+        "sources_skipped": 0,
+        "articles_seen": 0,
+        "articles_in_window": 0,
+        "articles_upserted": 0,
+        "pages_fetched": 0,
+        "stopped_by_cutoff": 0,
+        "stopped_by_short_page": 0,
+        "stopped_by_total_count": 0,
+        "stopped_by_page_cap": 0,
+    }
+    results = []
+
+    for index, source in enumerate(sources):
+        result = backfill_article_metadata_for_source(
+            store=store,
+            adapter=adapter,
+            source=source,
+            cutoff=cutoff,
+            count=args.count,
+            max_pages=args.max_pages_per_source,
+            retries=args.retries,
+            backoff_seconds=args.backoff_seconds,
+            page_delay_min=args.page_delay_min,
+            page_delay_max=args.page_delay_max,
+            dry_run=args.dry_run,
+            no_delay=args.no_delay,
+        )
+        results.append(result)
+        update_history_totals(totals, result)
+        delay_between_items(index, len(sources), args.delay_min, args.delay_max, disabled=args.no_delay)
+
+    payload = {
+        "ok": totals["sources_failed"] == 0,
+        "status": "dry_run" if args.dry_run else "saved",
+        "tier": args.tier,
+        "days": args.days,
+        "cutoff_utc": cutoff.replace(microsecond=0).isoformat(),
+        "source_offset": args.source_offset,
+        "max_sources": args.max_sources,
+        "count": args.count,
+        "max_pages_per_source": args.max_pages_per_source,
+        "policy": {
+            "delay_min_seconds": 0 if args.no_delay else args.delay_min,
+            "delay_max_seconds": 0 if args.no_delay else args.delay_max,
+            "page_delay_min_seconds": 0 if args.no_delay else args.page_delay_min,
+            "page_delay_max_seconds": 0 if args.no_delay else args.page_delay_max,
+            "retries": args.retries,
+            "backoff_seconds": args.backoff_seconds,
+        },
+        "totals": totals,
+        "results": results,
+    }
+    write_json(payload)
+    return 0 if payload["ok"] else 1
+
+
+def backfill_article_metadata_for_source(
+    *,
+    store: Store,
+    adapter: WeChatDownloadAPIAdapter,
+    source: dict,
+    cutoff: datetime,
+    count: int,
+    max_pages: int,
+    retries: int,
+    backoff_seconds: float,
+    page_delay_min: float,
+    page_delay_max: float,
+    dry_run: bool,
+    no_delay: bool,
+) -> dict:
+    fakeid = source.get("wechat_fakeid")
+    if not fakeid:
+        return {
+            "source_id": source["id"],
+            "source_name": source["name"],
+            "status": "skipped",
+            "reason": "missing_wechat_fakeid",
+        }
+
+    articles_seen = 0
+    articles_in_window = 0
+    articles_upserted = 0
+    pages_fetched = 0
+    oldest: datetime | None = None
+    seen_urls: set[str] = set()
+    total_count: int | None = None
+    dynamic_page_cap = max(1, max_pages)
+    stop_reason = "page_cap"
+
+    for page in range(max(1, max_pages)):
+        if page >= dynamic_page_cap:
+            stop_reason = "total_count_reached"
+            break
+
+        begin = page * count
+        payload = with_retries(
+            lambda: adapter.list_articles(fakeid=fakeid, begin=begin, count=count),
+            retries=retries,
+            backoff_seconds=backoff_seconds,
+        )
+        if not payload.get("ok"):
+            return {
+                "source_id": source["id"],
+                "source_name": source["name"],
+                "status": "failed",
+                "pages_fetched": pages_fetched,
+                "articles_seen": articles_seen,
+                "articles_in_window": articles_in_window,
+                "articles_upserted": articles_upserted,
+                "adapter": payload,
+            }
+
+        articles = normalize_article_items(payload.get("body"))
+        if total_count is None:
+            total_count = extract_article_total_count(payload.get("body"))
+            if total_count is not None and count > 0:
+                dynamic_page_cap = min(dynamic_page_cap, max(1, math.ceil(total_count / count) + 1))
+
+        pages_fetched += 1
+        if not articles:
+            stop_reason = "empty_page"
+            break
+
+        unique_articles = []
+        for article in articles:
+            url = article.get("url")
+            if url and url in seen_urls:
+                continue
+            if url:
+                seen_urls.add(url)
+            unique_articles.append(article)
+
+        articles_seen += len(unique_articles)
+        page_dates = [parse_article_publish_time(article.get("publish_time")) for article in unique_articles]
+        page_dates = [publish_time for publish_time in page_dates if publish_time]
+        if page_dates:
+            page_oldest = min(page_dates)
+            oldest = page_oldest if oldest is None else min(oldest, page_oldest)
+
+        articles_to_save = [article for article in unique_articles if article_metadata_in_window(article, cutoff)]
+        articles_in_window += len(articles_to_save)
+        if not dry_run:
+            saved = store.upsert_articles(source["id"], articles_to_save)
+            articles_upserted += saved["count"]
+
+        if page_dates and min(page_dates) < cutoff:
+            stop_reason = "cutoff_reached"
+            break
+        if total_count is not None and begin + count >= total_count:
+            stop_reason = "total_count_reached"
+            break
+        if total_count is None and len(articles) < count:
+            stop_reason = "short_page"
+            break
+        delay_between_items(page, dynamic_page_cap, page_delay_min, page_delay_max, disabled=no_delay)
+
+    return {
+        "source_id": source["id"],
+        "source_name": source["name"],
+        "status": "ok",
+        "pages_fetched": pages_fetched,
+        "articles_seen": articles_seen,
+        "articles_in_window": articles_in_window,
+        "articles_upserted": articles_upserted,
+        "oldest_publish_time": oldest.replace(microsecond=0).isoformat() if oldest else None,
+        "downloader_total_count": total_count,
+        "effective_page_cap": dynamic_page_cap,
+        "stop_reason": stop_reason,
+    }
+
+
+def parse_article_publish_time(value: object) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def article_metadata_in_window(article: dict, cutoff: datetime) -> bool:
+    publish_time = parse_article_publish_time(article.get("publish_time"))
+    if publish_time is None:
+        return True
+    return publish_time >= cutoff
+
+
+def extract_article_total_count(body: object) -> int | None:
+    if not isinstance(body, dict):
+        return None
+    data = body.get("data")
+    if not isinstance(data, dict):
+        data = body
+    for key in ("total", "total_count"):
+        value = data.get(key)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def update_history_totals(totals: dict[str, int], result: dict) -> None:
+    status = result.get("status")
+    if status == "ok":
+        totals["sources_ok"] += 1
+    elif status == "skipped":
+        totals["sources_skipped"] += 1
+    else:
+        totals["sources_failed"] += 1
+
+    totals["articles_seen"] += int(result.get("articles_seen") or 0)
+    totals["articles_in_window"] += int(result.get("articles_in_window") or 0)
+    totals["articles_upserted"] += int(result.get("articles_upserted") or 0)
+    totals["pages_fetched"] += int(result.get("pages_fetched") or 0)
+
+    stop_reason = result.get("stop_reason")
+    if stop_reason == "cutoff_reached":
+        totals["stopped_by_cutoff"] += 1
+    elif stop_reason in {"short_page", "empty_page"}:
+        totals["stopped_by_short_page"] += 1
+    elif stop_reason == "total_count_reached":
+        totals["stopped_by_total_count"] += 1
+    elif stop_reason == "page_cap":
+        totals["stopped_by_page_cap"] += 1
+
+
 def cmd_collect_content(args: argparse.Namespace) -> int:
     store = get_store(args)
     adapter = get_wechat_download_api(args)
@@ -2215,6 +2689,7 @@ def cmd_collect_content(args: argparse.Namespace) -> int:
         delay_max=delay_max,
         passes=args.passes,
         pass_cooldown_seconds=args.pass_cooldown_seconds,
+        progress_every=args.progress_every,
         no_delay=args.no_delay,
     )
 
@@ -2230,6 +2705,7 @@ def cmd_collect_content(args: argparse.Namespace) -> int:
                 "backoff_seconds": backoff_seconds,
                 "passes": args.passes,
                 "pass_cooldown_seconds": 0 if args.no_delay else args.pass_cooldown_seconds,
+                "progress_every": args.progress_every,
             },
             **content_result,
         }
@@ -2249,6 +2725,7 @@ def fetch_content_queue(
     delay_max: float,
     passes: int,
     pass_cooldown_seconds: float,
+    progress_every: int = 0,
     no_delay: bool,
 ) -> dict:
     """Fetch a fixed content queue over one or more internal passes."""
@@ -2268,9 +2745,11 @@ def fetch_content_queue(
         print(
             f"mpfeed: content pass {pass_index + 1}/{max_passes}, {len(pass_articles)} article(s) pending",
             file=sys.stderr,
+            flush=True,
         )
         pass_ok = 0
         pass_failed = 0
+        progress_every = max(0, int(progress_every or 0))
         for index, article in enumerate(pass_articles):
             result = fetch_and_store_article_content(
                 store=store,
@@ -2289,6 +2768,16 @@ def fetch_content_queue(
                 if not result.get("retryable"):
                     final_failed_ids.add(article["id"])
                     pending_by_id.pop(article["id"], None)
+            if progress_every and ((index + 1) % progress_every == 0 or index == len(pass_articles) - 1):
+                print(
+                    "mpfeed: content progress "
+                    f"pass={pass_index + 1}/{max_passes}, "
+                    f"{index + 1}/{len(pass_articles)} article(s), "
+                    f"ok={pass_ok}, failed={pass_failed}, remaining={len(pending_by_id)}, "
+                    f"last={article.get('title')!r}",
+                    file=sys.stderr,
+                    flush=True,
+                )
             delay_between_items(index, len(pass_articles), delay_min, delay_max, disabled=no_delay)
 
         pass_summaries.append(
@@ -2332,12 +2821,14 @@ def fetch_and_store_article_content(
         backoff_seconds=backoff_seconds,
     )
     if not payload["ok"]:
+        retry_after_seconds = article_probe_retry_after_seconds(payload)
         saved = store.upsert_article_content(article["id"], {}, fetch_error=adapter_error_message(payload))
         return {
             "article_id": article["id"],
             "title": article["title"],
             "ok": False,
             "retryable": retryable_status(payload),
+            "retry_after_seconds": retry_after_seconds,
             "error": adapter_error_message(payload),
             "saved": saved,
         }
@@ -2531,10 +3022,307 @@ def cmd_classify_sources(args: argparse.Namespace) -> int:
 def cmd_classify_articles(args: argparse.Namespace) -> int:
     store = get_store(args)
     taxonomy = load_taxonomy(resolve_taxonomy_arg(args.taxonomy))
-    rows = store.list_articles_with_content(limit=args.limit, source_id=args.source_id)
+    rows = store.list_articles_for_llm(limit=args.limit, source_id=args.source_id, content_scope="all")
     items = [store.save_classification(classify_article(row, taxonomy)) for row in rows]
     write_json({"ok": True, "taxonomy": taxonomy.name, "entity_type": "article", "count": len(items), "items": items})
     return 0
+
+
+def cmd_source_status(args: argparse.Namespace) -> int:
+    store = get_store(args)
+    source = find_source_for_agent(store, source_id=args.source_id, name=args.name, biz=args.biz)
+    if not source:
+        write_json(
+            {
+                "ok": True,
+                "status": "not_tracked",
+                "input": {"source_id": args.source_id or None, "name": args.name or None, "biz": args.biz or None},
+                "taxonomy": source_taxonomy_options(args.taxonomy),
+                "next_action": "If the user asked to follow/add, run the intake flow. Otherwise ask before adding.",
+            }
+        )
+        return 0
+
+    write_json(
+        {
+            "ok": True,
+            "status": "source_status",
+            "intake_state": source.get("status"),
+            "source": source,
+            "input": {"source_id": args.source_id or None, "name": args.name or None, "biz": args.biz or None},
+            "source_snapshot": source_snapshot(store, source["id"]),
+            "taxonomy": source_taxonomy_options(args.taxonomy),
+            "next_action": "Use source taxonomy and classification helpers; do not edit SQLite directly.",
+        }
+    )
+    return 0
+
+
+def cmd_source_set_status(args: argparse.Namespace) -> int:
+    store = get_store(args)
+    source = find_source_for_agent(store, source_id=args.source_id, name=args.name, biz=args.biz)
+    if not source:
+        write_json(
+            {
+                "ok": False,
+                "status": "source_not_found",
+                "input": {"source_id": args.source_id or None, "name": args.name or None, "biz": args.biz or None},
+                "next_action": "Run intake/onboarding before setting status for an unknown source.",
+            }
+        )
+        return 2
+
+    update = store.update_source(source["id"], status=args.status)
+    snapshot = source_snapshot(store, source["id"])
+    write_json(
+        {
+            "ok": True,
+            "status": "source_status_updated",
+            "requested_status": args.status,
+            "update": update,
+            "source": store.get_source(source["id"]),
+            "source_snapshot": snapshot,
+            "next_action": "Use inactive for unsubscribe, active for explicit re-follow, archived for long-term removal, and needs_review when user confirmation is required.",
+        }
+    )
+    return 0
+
+
+def cmd_source_taxonomy(args: argparse.Namespace) -> int:
+    write_json({"ok": True, "status": "taxonomy", "taxonomy": source_taxonomy_options(args.taxonomy)})
+    return 0
+
+
+def cmd_source_confirm_classification(args: argparse.Namespace) -> int:
+    store = get_store(args)
+    source = find_source_for_agent(store, source_id=args.source_id, name=args.name, biz=args.biz)
+    if not source:
+        write_json(
+            {
+                "ok": False,
+                "status": "source_not_found",
+                "input": {"source_id": args.source_id or None, "name": args.name or None, "biz": args.biz or None},
+                "next_action": "Run source status or onboarding first; do not classify an unknown source.",
+            }
+        )
+        return 2
+
+    requested_tags = parse_tag_ids(args.tags)
+    validation = validate_source_classification_request(
+        taxonomy_name=args.taxonomy,
+        category=args.category,
+        source_attribute=args.source_attribute,
+        tags=requested_tags,
+    )
+    if not validation["ok"]:
+        write_json(
+            {
+                "ok": False,
+                "status": "classification_validation_failed",
+                "source": source,
+                "classification_request": {
+                    "category": args.category,
+                    "source_attribute": args.source_attribute or None,
+                    "tags": requested_tags,
+                    "confidence": args.confidence,
+                    "method": args.method,
+                },
+                "validation": validation,
+                "taxonomy": source_taxonomy_options(args.taxonomy),
+                "next_action": "Ask the user to choose allowed taxonomy ids or keep unsupported labels as suggestions.",
+            }
+        )
+        return 2
+
+    classification = store.replace_source_classification(
+        {
+            "entity_type": "source",
+            "entity_id": source["id"],
+            "taxonomy": args.taxonomy,
+            "category": args.category,
+            "tags": validation["normalized_tags"],
+            "confidence": max(0.0, min(1.0, args.confidence)),
+            "method": args.method,
+        }
+    )
+    confirmed_review = None
+    if args.review_id:
+        confirmed_review = store.update_source_classification_review_status(args.review_id, "confirmed")
+    snapshot = source_snapshot(store, source["id"])
+    write_json(
+        {
+            "ok": True,
+            "status": "classification_confirmed",
+            "source": source,
+            "classification": classification,
+            "confirmed_review": confirmed_review,
+            "readback": snapshot.get("latest_classification"),
+            "source_snapshot": snapshot,
+            "taxonomy": source_taxonomy_options(args.taxonomy),
+            "next_action": "Report the classification only after checking readback.category and readback.tags.",
+        }
+    )
+    return 0
+
+
+def cmd_source_refresh_latest(args: argparse.Namespace) -> int:
+    store = get_store(args)
+    source = find_source_for_agent(store, source_id=args.source_id, name=args.name, biz=args.biz, statuses=("active",))
+    if not source:
+        write_json(
+            {
+                "ok": False,
+                "status": "source_not_active",
+                "input": {"source_id": args.source_id or None, "name": args.name or None, "biz": args.biz or None},
+                "next_action": "Check source status first. Reactivate only when the user explicitly asks to follow again.",
+            }
+        )
+        return 2
+    fakeid = source.get("wechat_fakeid")
+    if not fakeid:
+        write_json({"ok": False, "status": "missing_wechat_fakeid", "source": source})
+        return 2
+    if args.count <= 0:
+        latest = {"ok": True, "count": 0, "items": [], "status": "skipped_by_article_count"}
+        write_json(
+            {
+                "ok": True,
+                "status": "latest_refreshed",
+                "source": source,
+                "latest_articles": latest,
+                "source_snapshot": source_snapshot(store, source["id"]),
+            }
+        )
+        return 0
+
+    adapter = get_wechat_download_api(args)
+    payload = with_retries(
+        lambda: adapter.list_articles(fakeid=fakeid, begin=0, count=args.count),
+        retries=args.retries,
+        backoff_seconds=args.backoff_seconds,
+    )
+    if not payload["ok"]:
+        write_json({"ok": False, "status": "latest_refresh_failed", "source": source, "adapter": payload})
+        return 2
+    articles = normalize_article_items(payload["body"])
+    saved = store.upsert_articles(source["id"], articles)
+    write_json(
+        {
+            "ok": True,
+            "status": "latest_refreshed",
+            "source": source,
+            "latest_articles": {"ok": True, "count": saved["count"], "items": saved["items"]},
+            "source_snapshot": source_snapshot(store, source["id"]),
+        }
+    )
+    return 0
+
+
+def find_source_for_agent(
+    store: Store,
+    *,
+    source_id: str = "",
+    name: str = "",
+    biz: str = "",
+    statuses: tuple[str, ...] = ("active", "inactive", "archived", "needs_review"),
+) -> dict | None:
+    sources = store.list_sources(limit=100_000)
+    if source_id:
+        return next((source for source in sources if source["id"] == source_id), None)
+    if biz:
+        return next((source for source in sources if source.get("biz") == biz and source.get("status") in statuses), None)
+    if name:
+        for source in sources:
+            if source.get("status") in statuses and names_equivalent(name, source["name"]):
+                return source
+    return None
+
+
+def source_snapshot(store: Store, source_id: str) -> dict:
+    classifications = [
+        row
+        for row in store.list_classifications(limit=100_000, entity_type="source")
+        if row.get("entity_id") == source_id
+    ]
+    articles = store.list_articles(limit=5, source_id=source_id)
+    all_articles = store.list_articles(limit=100_000, source_id=source_id)
+    pending_reviews = store.list_source_classification_reviews(limit=20, source_id=source_id, status="pending")
+    content_ok_count = sum(1 for row in all_articles if row.get("crawl_status") == "content_ok")
+    return {
+        "latest_classification": classifications[0] if classifications else None,
+        "classifications": classifications,
+        "pending_classification_reviews": pending_reviews,
+        "article_count": len(all_articles),
+        "content_ok_count": content_ok_count,
+        "latest_articles": articles,
+    }
+
+
+def source_taxonomy_options(taxonomy_name: str) -> dict:
+    taxonomy = load_taxonomy(resolve_taxonomy_arg(taxonomy_name))
+    source_attributes = []
+    tag_groups = []
+    for group in taxonomy.tag_groups:
+        tags = [{"id": tag.id, "name_zh": tag.name_zh} for tag in group.tags]
+        tag_groups.append({"id": group.id, "name_zh": group.name_zh, "tags": tags})
+        if group.id == "source_attribute":
+            source_attributes = tags
+    return {
+        "ok": True,
+        "name": taxonomy.name,
+        "source_categories": [{"id": entry.id, "name_zh": entry.name_zh} for entry in taxonomy.source_categories],
+        "source_attributes": source_attributes,
+        "tag_groups": tag_groups,
+        "invalid_ids_must_not_be_written": True,
+    }
+
+
+def parse_tag_ids(value: str) -> list[str]:
+    return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def validate_source_classification_request(
+    *,
+    taxonomy_name: str,
+    category: str,
+    source_attribute: str,
+    tags: list[str],
+) -> dict:
+    taxonomy = load_taxonomy(resolve_taxonomy_arg(taxonomy_name))
+    allowed_categories = {entry.id for entry in taxonomy.source_categories}
+    source_attribute_ids = set()
+    all_tag_ids = set()
+    for group in taxonomy.tag_groups:
+        group_ids = {tag.id for tag in group.tags}
+        all_tag_ids.update(group_ids)
+        if group.id == "source_attribute":
+            source_attribute_ids = group_ids
+
+    errors = []
+    if not category:
+        errors.append("category_required")
+    elif category not in allowed_categories:
+        errors.append(f"invalid_category:{category}")
+
+    normalized_tags = []
+    if source_attribute:
+        if source_attribute not in source_attribute_ids:
+            errors.append(f"invalid_source_attribute:{source_attribute}")
+        else:
+            normalized_tags.append(source_attribute)
+
+    for tag in tags:
+        if tag not in all_tag_ids:
+            errors.append(f"invalid_tag:{tag}")
+        elif tag not in normalized_tags:
+            normalized_tags.append(tag)
+
+    return {
+        "ok": not errors,
+        "errors": errors,
+        "normalized_tags": normalized_tags,
+        "allowed_taxonomy": source_taxonomy_options(taxonomy_name),
+    }
 
 
 def cmd_digest_articles(args: argparse.Namespace) -> int:
@@ -2574,9 +3362,22 @@ def cmd_digest_articles(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_archive_assets(args: argparse.Namespace) -> int:
+    result = cache_full_archive_assets(
+        store=get_store(args),
+        output_dir=Path(args.output_dir).expanduser(),
+        limit=effective_unbounded_limit(args.limit),
+        timeout=args.timeout,
+        overwrite=args.overwrite,
+    )
+    write_json(result)
+    return 0 if result["ok"] else 1
+
+
 def cmd_llm_export_jobs(args: argparse.Namespace) -> int:
     store = get_store(args)
     taxonomy = load_taxonomy(resolve_taxonomy_arg(args.taxonomy))
+    retention_levels = retention_levels_for_llm_export(args.article_retention)
     payload = build_llm_jobs(
         store=store,
         taxonomy=taxonomy,
@@ -2584,6 +3385,13 @@ def cmd_llm_export_jobs(args: argparse.Namespace) -> int:
         limit=args.limit,
         source_id=args.source_id,
         content_chars=args.content_chars,
+        source_article_limit=args.source_article_limit,
+        article_content_scope=args.article_content_scope,
+        article_updated_after=args.article_updated_after,
+        article_published_after=args.article_published_after,
+        article_published_before=args.article_published_before,
+        article_retention_levels=retention_levels,
+        article_analysis_stage=args.article_analysis_stage,
     )
     if args.output:
         output_path = Path(args.output).expanduser()
@@ -2593,6 +3401,14 @@ def cmd_llm_export_jobs(args: argparse.Namespace) -> int:
         return 0
     write_json(payload)
     return 0
+
+
+def retention_levels_for_llm_export(value: str) -> tuple[str, ...] | None:
+    if value == "all":
+        return None
+    if value == "content_or_archive":
+        return ("content", "full_archive")
+    return (value,)
 
 
 def cmd_llm_export_onboarding_jobs(args: argparse.Namespace) -> int:
@@ -2620,10 +3436,11 @@ def cmd_llm_export_onboarding_jobs(args: argparse.Namespace) -> int:
 def cmd_llm_import_results(args: argparse.Namespace) -> int:
     with open(args.file, encoding="utf-8") as handle:
         payload = json.load(handle)
+    taxonomy = load_taxonomy(resolve_taxonomy_arg(args.taxonomy))
     result = apply_llm_results(
         store=get_store(args),
         payload=payload,
-        default_taxonomy=args.taxonomy,
+        default_taxonomy=taxonomy,
         default_model=args.model,
     )
     write_json(result)
@@ -2750,6 +3567,7 @@ def cmd_run_agent_smoke(args: argparse.Namespace) -> int:
         entity_type="article",
         limit=args.limit,
         content_chars=args.content_chars,
+        article_content_scope="all",
     )
 
     feed_output = work_dir / "feed-items.csv"
@@ -2808,6 +3626,169 @@ def cmd_run_agent_smoke(args: argparse.Namespace) -> int:
                 "Inspect article-llm-jobs.json and confirm it is suitable for article-level semantic analysis.",
                 "For real deployment, replace the demo database/config with the user's private reviewed source registry.",
             ],
+        }
+    )
+    return 0
+
+
+def cmd_run_llm_feed(args: argparse.Namespace) -> int:
+    work_dir = Path(args.work_dir).expanduser()
+    work_dir.mkdir(parents=True, exist_ok=True)
+    store = get_store(args)
+    store.init()
+    taxonomy = load_taxonomy(resolve_taxonomy_arg(args.taxonomy))
+    limit = effective_unbounded_limit(args.limit)
+
+    metadata_jobs_path = work_dir / "article-metadata-jobs.json"
+    content_jobs_path = work_dir / "article-content-jobs.json"
+    digest_dir = work_dir / "digest-packs"
+    digest_dir.mkdir(parents=True, exist_ok=True)
+
+    metadata_jobs = build_llm_jobs(
+        store=store,
+        taxonomy=taxonomy,
+        entity_type="article",
+        limit=limit,
+        article_content_scope="metadata",
+        article_published_after=args.published_after,
+        article_published_before=args.published_before,
+        article_analysis_stage="metadata",
+    )
+    metadata_jobs_path.write_text(json.dumps(metadata_jobs, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    metadata_imported = None
+    content_fetch = None
+    content_jobs = None
+    content_imported = None
+    digest_packs = []
+    service = None
+
+    if args.metadata_results:
+        with open(args.metadata_results, encoding="utf-8") as handle:
+            metadata_imported = apply_llm_results(
+                store,
+                json.load(handle),
+                default_taxonomy=args.taxonomy,
+                default_model=args.model,
+                taxonomy=taxonomy,
+            )
+
+        if args.fetch_content:
+            adapter = get_wechat_download_api(args)
+            base_url = args.base_url or adapter_base_url_from_env(required=True)
+            health = safe_adapter_call(adapter.health)
+            auth_status = safe_adapter_call(adapter.auth_status) if health.get("ok") else None
+            service = {"base_url": base_url, "health": health, "auth_status": auth_status}
+            if not health.get("ok") or not (auth_status and auth_status_logged_in(auth_status)):
+                write_json(
+                    {
+                        "ok": False,
+                        "stage": "doctor",
+                        "db": str(store.db_path),
+                        "service": service,
+                        "login_url": login_url_for_base(base_url),
+                        "outputs": {"metadata_jobs": str(metadata_jobs_path)},
+                    }
+                )
+                return 1
+            content_fetch = fetch_content_queue(
+                store=store,
+                adapter=adapter,
+                limit=effective_unbounded_limit(args.content_limit),
+                retention_levels=retention_levels_for_content_fetch(args.content_retention),
+                retries=args.content_retries,
+                backoff_seconds=args.content_backoff_seconds,
+                delay_min=args.content_delay_min,
+                delay_max=args.content_delay_max,
+                passes=args.content_passes,
+                pass_cooldown_seconds=args.content_pass_cooldown_seconds,
+                progress_every=args.progress_every,
+                no_delay=args.no_delay,
+            )
+
+        content_jobs = build_llm_jobs(
+            store=store,
+            taxonomy=taxonomy,
+            entity_type="article",
+            limit=limit,
+            content_chars=args.content_chars,
+            article_content_scope="content",
+            article_published_after=args.published_after,
+            article_published_before=args.published_before,
+            article_retention_levels=("content", "full_archive"),
+            article_analysis_stage="content",
+        )
+        content_jobs_path.write_text(json.dumps(content_jobs, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    if args.content_results:
+        with open(args.content_results, encoding="utf-8") as handle:
+            content_imported = apply_llm_results(
+                store,
+                json.load(handle),
+                default_taxonomy=args.taxonomy,
+                default_model=args.model,
+                taxonomy=taxonomy,
+            )
+        for target in (
+            "daily_digest",
+            "weekly_report",
+            "strategy_backlog",
+            "market_view",
+            "industry_tracking",
+            "risk_monitoring",
+        ):
+            rows = store.list_digests(
+                limit=limit,
+                application_target=target,
+                min_score=args.digest_min_score,
+                analysis_stage="content",
+            )
+            path = digest_dir / f"{target}.md"
+            path.write_text(format_digests_markdown(rows) + "\n", encoding="utf-8")
+            context_rows = build_digest_context_rows(
+                store=store,
+                limit=limit,
+                application_target=target,
+                min_score=args.digest_min_score,
+                analysis_stage="content",
+                include_html=False,
+                include_assets=True,
+                require_content=False,
+                max_content_chars=0,
+            )
+            context_path = digest_dir / f"{target}.context.json"
+            context_path.write_text(json.dumps(context_rows, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            digest_packs.append({"target": target, "path": str(path), "context_path": str(context_path), "count": len(rows)})
+
+    next_steps = []
+    if not args.metadata_results:
+        next_steps.append(f"Ask an agent/LLM to complete metadata jobs at {metadata_jobs_path}, then rerun with --metadata-results <file>.")
+    elif content_jobs is not None and not args.content_results:
+        next_steps.append(f"Ask an agent/LLM to complete content jobs at {content_jobs_path}, then rerun with --content-results <file>.")
+    else:
+        next_steps.append(f"Review digest packs in {digest_dir}.")
+
+    write_json(
+        {
+            "ok": True,
+            "db": str(store.db_path),
+            "service": service,
+            "window": {
+                "published_after": args.published_after,
+                "published_before": args.published_before,
+            },
+            "metadata_imported": metadata_imported,
+            "content_fetch": content_fetch,
+            "content_imported": content_imported,
+            "outputs": {
+                "metadata_jobs": str(metadata_jobs_path),
+                "metadata_jobs_count": metadata_jobs["count"],
+                "content_jobs": str(content_jobs_path) if content_jobs is not None else None,
+                "content_jobs_count": content_jobs["count"] if content_jobs is not None else None,
+                "digest_dir": str(digest_dir),
+                "digest_packs": digest_packs,
+            },
+            "next_steps": next_steps,
         }
     )
     return 0
@@ -2924,7 +3905,7 @@ def cmd_run_onboarding(args: argparse.Namespace) -> int:
             llm_imported = apply_llm_results(
                 store=store,
                 payload=json.load(handle),
-                default_taxonomy=args.taxonomy,
+                default_taxonomy=taxonomy,
                 default_model="llm:agent",
             )
 
@@ -3000,37 +3981,21 @@ def cmd_run_feed(args: argparse.Namespace) -> int:
         print(
             f"mpfeed: refreshing article metadata for {len(sources)} active source(s)",
             file=sys.stderr,
+            flush=True,
         )
         results = []
         skipped = []
         total_articles = 0
+        progress_every = max(0, int(getattr(args, "progress_every", 0) or 0))
         for index, source in enumerate(sources):
-            fakeid = source.get("wechat_fakeid")
-            if not fakeid:
-                skipped.append({"source_id": source["id"], "name": source["name"], "reason": "missing_wechat_fakeid"})
-                continue
-            payload = with_retries(
-                lambda: adapter.list_articles(fakeid=fakeid, begin=args.begin, count=args.count),
-                retries=args.retries,
-                backoff_seconds=args.backoff_seconds,
-            )
-            if not payload["ok"]:
-                results.append({"source_id": source["id"], "name": source["name"], "ok": False, "adapter": payload})
-                delay_between_items(index, len(sources), args.delay_min, args.delay_max, disabled=args.no_delay)
-                continue
-
-            articles = normalize_article_items(payload["body"])
-            saved = store.upsert_articles(source["id"], articles)
-            total_articles += saved["count"]
-            results.append(
-                {
-                    "source_id": source["id"],
-                    "name": source["name"],
-                    "fakeid": fakeid,
-                    "ok": True,
-                    "count": saved["count"],
-                }
-            )
+            result = refresh_article_metadata_for_source(store=store, adapter=adapter, source=source, args=args)
+            if result["status"] == "skipped":
+                skipped.append(result)
+            else:
+                results.append(result)
+                total_articles += int(result.get("articles_upserted") or result.get("count") or 0)
+            if progress_every and ((index + 1) % progress_every == 0 or index == len(sources) - 1):
+                print_article_metadata_progress(index, sources, results, skipped, total_articles, source)
             delay_between_items(index, len(sources), args.delay_min, args.delay_max, disabled=args.no_delay)
 
         refreshed = {
@@ -3041,6 +4006,10 @@ def cmd_run_feed(args: argparse.Namespace) -> int:
             "policy": {
                 "article_count": args.count,
                 "begin": args.begin,
+                "refresh_mode": args.refresh_mode,
+                "incremental_max_pages": args.incremental_max_pages,
+                "incremental_page_delay_min_seconds": 0 if args.no_delay else args.incremental_page_delay_min,
+                "incremental_page_delay_max_seconds": 0 if args.no_delay else args.incremental_page_delay_max,
                 "delay_min_seconds": 0 if args.no_delay else args.delay_min,
                 "delay_max_seconds": 0 if args.no_delay else args.delay_max,
                 "retries": args.retries,
@@ -3053,7 +4022,7 @@ def cmd_run_feed(args: argparse.Namespace) -> int:
 
     scored = None
     if args.full or args.score_articles:
-        print("mpfeed: scoring articles with rules_v1", file=sys.stderr)
+        print("mpfeed: scoring articles with rules_v1", file=sys.stderr, flush=True)
         scored_result = classify_and_digest_articles(
             store=store,
             taxonomy=load_taxonomy(resolve_taxonomy_arg(args.taxonomy)),
@@ -3077,6 +4046,7 @@ def cmd_run_feed(args: argparse.Namespace) -> int:
         print(
             f"mpfeed: fetching retained content for {len(articles)} article(s)",
             file=sys.stderr,
+            flush=True,
         )
         content = fetch_content_queue(
             store=store,
@@ -3089,6 +4059,7 @@ def cmd_run_feed(args: argparse.Namespace) -> int:
             delay_max=args.content_delay_max,
             passes=args.content_passes,
             pass_cooldown_seconds=args.content_pass_cooldown_seconds,
+            progress_every=args.progress_every,
             no_delay=args.no_delay,
         )
         content["retention_levels"] = list(retention_levels) if retention_levels else "all"
@@ -3126,6 +4097,173 @@ def cmd_run_feed(args: argparse.Namespace) -> int:
         }
     )
     return 0
+
+
+def refresh_article_metadata_for_source(
+    *,
+    store: Store,
+    adapter: WeChatDownloadAPIAdapter,
+    source: dict,
+    args: argparse.Namespace,
+) -> dict:
+    fakeid = source.get("wechat_fakeid")
+    if not fakeid:
+        return {
+            "source_id": source["id"],
+            "name": source["name"],
+            "status": "skipped",
+            "reason": "missing_wechat_fakeid",
+        }
+
+    if args.refresh_mode == "latest":
+        payload = with_retries(
+            lambda: adapter.list_articles(fakeid=fakeid, begin=args.begin, count=args.count),
+            retries=args.retries,
+            backoff_seconds=args.backoff_seconds,
+        )
+        if not payload["ok"]:
+            return {"source_id": source["id"], "name": source["name"], "ok": False, "status": "failed", "adapter": payload}
+
+        articles = normalize_article_items(payload["body"])
+        saved = store.upsert_articles(source["id"], articles)
+        return {
+            "source_id": source["id"],
+            "name": source["name"],
+            "fakeid": fakeid,
+            "ok": True,
+            "status": "ok",
+            "refresh_mode": "latest",
+            "pages_fetched": 1,
+            "count": saved["count"],
+            "articles_seen": len(articles),
+            "articles_upserted": saved["count"],
+            "stop_reason": "latest_page",
+        }
+
+    boundary = store.latest_article_for_source(source["id"])
+    if not boundary:
+        payload = with_retries(
+            lambda: adapter.list_articles(fakeid=fakeid, begin=args.begin, count=args.count),
+            retries=args.retries,
+            backoff_seconds=args.backoff_seconds,
+        )
+        if not payload["ok"]:
+            return {"source_id": source["id"], "name": source["name"], "ok": False, "status": "failed", "adapter": payload}
+        articles = normalize_article_items(payload["body"])
+        saved = store.upsert_articles(source["id"], articles)
+        return {
+            "source_id": source["id"],
+            "name": source["name"],
+            "fakeid": fakeid,
+            "ok": True,
+            "status": "ok",
+            "refresh_mode": "incremental",
+            "pages_fetched": 1,
+            "count": saved["count"],
+            "articles_seen": len(articles),
+            "articles_upserted": saved["count"],
+            "stop_reason": "no_local_boundary",
+        }
+
+    boundary_url = str(boundary.get("url") or "")
+    boundary_time = parse_article_publish_time(boundary.get("publish_time"))
+    articles_seen = 0
+    articles_upserted = 0
+    pages_fetched = 0
+    seen_urls: set[str] = set()
+    total_count: int | None = None
+    dynamic_page_cap = max(1, int(args.incremental_max_pages or 1))
+    stop_reason = "page_cap"
+
+    for page in range(dynamic_page_cap):
+        begin = args.begin + page * args.count
+        payload = with_retries(
+            lambda: adapter.list_articles(fakeid=fakeid, begin=begin, count=args.count),
+            retries=args.retries,
+            backoff_seconds=args.backoff_seconds,
+        )
+        if not payload["ok"]:
+            return {
+                "source_id": source["id"],
+                "name": source["name"],
+                "ok": False,
+                "status": "failed",
+                "refresh_mode": "incremental",
+                "pages_fetched": pages_fetched,
+                "articles_seen": articles_seen,
+                "articles_upserted": articles_upserted,
+                "adapter": payload,
+            }
+
+        articles = normalize_article_items(payload["body"])
+        if total_count is None:
+            total_count = extract_article_total_count(payload.get("body"))
+            if total_count is not None and args.count > 0:
+                dynamic_page_cap = min(dynamic_page_cap, max(1, math.ceil(total_count / args.count) + 1))
+        pages_fetched += 1
+        if not articles:
+            stop_reason = "empty_page"
+            break
+
+        unique_articles = []
+        for article in articles:
+            url = article.get("url")
+            if url and url in seen_urls:
+                continue
+            if url:
+                seen_urls.add(url)
+            unique_articles.append(article)
+
+        articles_seen += len(unique_articles)
+        boundary_seen = False
+        articles_to_save = []
+        page_dates = []
+        for article in unique_articles:
+            url = str(article.get("url") or "")
+            publish_time = parse_article_publish_time(article.get("publish_time"))
+            if publish_time:
+                page_dates.append(publish_time)
+            if boundary_url and url == boundary_url:
+                boundary_seen = True
+            if boundary_time is None or publish_time is None or publish_time >= boundary_time:
+                articles_to_save.append(article)
+
+        saved = store.upsert_articles(source["id"], articles_to_save)
+        articles_upserted += saved["count"]
+
+        if boundary_seen:
+            stop_reason = "boundary_url_reached"
+            break
+        if boundary_time and page_dates and max(page_dates) < boundary_time:
+            stop_reason = "older_than_boundary"
+            break
+        if total_count is not None and begin + args.count >= total_count:
+            stop_reason = "total_count_reached"
+            break
+        delay_between_items(
+            page,
+            dynamic_page_cap,
+            args.incremental_page_delay_min,
+            args.incremental_page_delay_max,
+            disabled=args.no_delay,
+        )
+
+    return {
+        "source_id": source["id"],
+        "name": source["name"],
+        "fakeid": fakeid,
+        "ok": True,
+        "status": "ok",
+        "refresh_mode": "incremental",
+        "pages_fetched": pages_fetched,
+        "count": articles_upserted,
+        "articles_seen": articles_seen,
+        "articles_upserted": articles_upserted,
+        "boundary_article_id": boundary.get("id"),
+        "boundary_publish_time": boundary.get("publish_time"),
+        "downloader_total_count": total_count,
+        "stop_reason": stop_reason,
+    }
 
 
 def import_onboarding_input(store: Store, args: argparse.Namespace) -> dict | None:
@@ -3434,7 +4572,7 @@ def classify_and_digest_articles(
     limit: int,
     min_score: float,
 ) -> dict:
-    rows = store.list_articles_with_content(limit=limit)
+    rows = store.list_articles_for_llm(limit=limit, content_scope="all")
     saved = []
     skipped = []
     for row in rows:
@@ -3497,6 +4635,130 @@ def format_digests_markdown(rows: list[dict]) -> str:
             lines.append("")
             lines.append(f"Reason: {row['reason']}")
         lines.append("")
+
+    return "\n".join(lines).rstrip()
+
+
+def build_digest_context_rows(
+    *,
+    store: Store,
+    limit: int,
+    application_target: str | None,
+    min_score: float | None,
+    analysis_stage: str | None,
+    include_html: bool,
+    include_assets: bool,
+    require_content: bool,
+    max_content_chars: int,
+) -> list[dict]:
+    digests = store.list_digests(
+        limit=limit,
+        application_target=application_target,
+        min_score=min_score,
+        analysis_stage=analysis_stage,
+    )
+    rows = []
+    for digest in digests:
+        content = store.get_article_content(digest["article_id"]) or {}
+        content_available = bool(
+            content.get("content_text")
+            or content.get("content_markdown")
+            or (include_html and content.get("content_html"))
+            or content.get("content_structure")
+        )
+        if require_content and not content_available:
+            continue
+
+        article = {
+            "article_id": digest["article_id"],
+            "source_id": digest.get("source_id") or content.get("source_id"),
+            "source_name": digest.get("source_name") or content.get("source_name"),
+            "title": digest.get("title") or content.get("title"),
+            "url": digest.get("url") or content.get("url"),
+            "publish_time": digest.get("publish_time") or content.get("publish_time"),
+            "abstract": content.get("digest"),
+            "cover_url": content.get("cover_url"),
+            "crawl_status": content.get("crawl_status"),
+            "retention_level": content.get("retention_level"),
+            "archive_status": content.get("archive_status"),
+            "retention_reason": content.get("retention_reason"),
+            "content_available": content_available,
+            "content_text": truncate_text(content.get("content_text"), max_content_chars),
+            "content_markdown": truncate_text(content.get("content_markdown"), max_content_chars),
+            "content_structure": content.get("content_structure") or [],
+            "fetch_error": content.get("fetch_error"),
+            "extracted_at": content.get("extracted_at"),
+        }
+        if include_html:
+            article["content_html"] = truncate_text(content.get("content_html"), max_content_chars)
+
+        rows.append(
+            {
+                "digest": {
+                    "id": digest.get("id"),
+                    "summary": digest.get("summary"),
+                    "key_points": digest.get("key_points") or [],
+                    "importance_score": digest.get("importance_score"),
+                    "score_breakdown": digest.get("score_breakdown") or {},
+                    "application_targets": digest.get("application_targets") or [],
+                    "analysis_stage": digest.get("analysis_stage"),
+                    "reason": digest.get("reason"),
+                    "model": digest.get("model"),
+                    "created_at": digest.get("created_at"),
+                },
+                "article": article,
+                "assets": store.list_article_assets(article_id=digest["article_id"], limit=1000) if include_assets else [],
+            }
+        )
+    return rows
+
+
+def truncate_text(value: str | None, max_chars: int) -> str | None:
+    if value is None or not max_chars or max_chars <= 0 or len(value) <= max_chars:
+        return value
+    return value[:max_chars] + "\n...[truncated]"
+
+
+def format_digest_context_markdown(rows: list[dict]) -> str:
+    lines = ["# WeChat MP Digest Context", ""]
+    if not rows:
+        lines.append("_No digest contexts found._")
+        return "\n".join(lines)
+
+    for row in rows:
+        article = row["article"]
+        digest = row["digest"]
+        assets = row.get("assets") or []
+        source = f" ({article['source_name']})" if article.get("source_name") else ""
+        lines.append(f"## {article['title']}{source}")
+        lines.append("")
+        lines.append(f"- Score: {digest.get('importance_score')}")
+        if article.get("publish_time"):
+            lines.append(f"- Published: {article['publish_time']}")
+        lines.append(f"- URL: {article['url']}")
+        lines.append(f"- Content available: {article.get('content_available')}")
+        if assets:
+            cached = sum(1 for asset in assets if asset.get("download_status") == "cached")
+            lines.append(f"- Images/assets: {len(assets)} total, {cached} cached")
+        lines.append("")
+        if digest.get("summary"):
+            lines.append("### Stored Digest")
+            lines.append("")
+            lines.append(digest["summary"])
+            lines.append("")
+        text = article.get("content_markdown") or article.get("content_text")
+        if text:
+            lines.append("### Source Content")
+            lines.append("")
+            lines.append(text)
+            lines.append("")
+        if assets:
+            lines.append("### Assets")
+            lines.append("")
+            for asset in assets:
+                location = asset.get("local_path") or asset.get("url")
+                lines.append(f"- {asset.get('content_ref') or asset.get('id')}: {location}")
+            lines.append("")
 
     return "\n".join(lines).rstrip()
 
@@ -3759,7 +5021,18 @@ def clean_optional(value: object) -> str | None:
 def with_retries(call, retries: int, backoff_seconds: float) -> dict:
     attempts = 0
     while True:
-        payload = call()
+        try:
+            payload = call()
+        except Exception as exc:  # noqa: BLE001 - convert adapter/network exceptions into retryable payloads.
+            payload = {
+                "ok": False,
+                "operation": "adapter_call",
+                "status": 0,
+                "body": {
+                    "error": str(exc),
+                    "exception_type": type(exc).__name__,
+                },
+            }
         if payload.get("ok") or not retryable_status(payload) or attempts >= retries:
             return payload
         attempts += 1
@@ -3784,6 +5057,27 @@ def delay_between_items(index: int, total: int, delay_min: float, delay_max: flo
     low = max(0.0, min(delay_min, delay_max))
     high = max(delay_min, delay_max)
     time.sleep(random.uniform(low, high))
+
+
+def print_article_metadata_progress(
+    index: int,
+    sources: list[dict],
+    results: list[dict],
+    skipped: list[dict],
+    total_articles: int,
+    source: dict,
+) -> None:
+    print(
+        "mpfeed: article metadata progress "
+        f"{index + 1}/{len(sources)} source(s), "
+        f"saved={total_articles}, "
+        f"ok={sum(1 for item in results if item.get('ok'))}, "
+        f"failed={sum(1 for item in results if item.get('ok') is False)}, "
+        f"skipped={len(skipped)}, "
+        f"last={source['name']!r}",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def cmd_wd_health(args: argparse.Namespace) -> int:

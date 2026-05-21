@@ -8,7 +8,7 @@ skills/wechat-mp-feed/
 
 It is intended to work across SKILL.md-compatible agent systems, including Claude Code, Codex-style skill loaders, and other tools that can register markdown workflow instructions.
 
-The skill is a first-class interface for this project. The CLI remains the execution layer; the skill gives an agent the operating playbook: which command to run, which outputs to read, how to handle login failures, and how to move from feed data into finance research workflows.
+The skill is a first-class interface for this project. The CLI remains the execution layer; the skill gives an agent the operating playbook: which command to run, which outputs to read, how to handle login failures, how to manage single-source intake or subscription state, and how to move from feed data into application workflows.
 
 ## What The Skill Does
 
@@ -18,9 +18,11 @@ The skill teaches an agent how to:
 - onboard large first-run account lists from files, screenshots, recordings, or article URLs;
 - operate `mpfeed run feed --config`;
 - inspect feed health and failures;
-- export article-level LLM jobs;
+- run the two-stage semantic feed workflow;
+- export article-level LLM jobs and application-layer digest context;
+- manage single-source intake, classification confirmation, unsubscribe, and reactivation through safe source commands;
 - keep private WeChat/account data outside the public repository;
-- build finance research inbox/digest workflows above the feed layer.
+- build application inbox/digest workflows above the feed layer, including the built-in finance research workflow.
 
 ## Agent Operating Contract
 
@@ -32,7 +34,9 @@ An agent using this skill should:
 - use reviewed sources as the identity source of truth;
 - read `feed-summary` before summarizing feed health;
 - read `feed-failures` before recommending retries;
-- export article LLM jobs before doing semantic article analysis;
+- use staged article LLM jobs before semantic article analysis;
+- use `digest-context` when final reports require original text, structured content, or image assets;
+- write source classification and subscription state only through `mpfeed source` helpers;
 - report downloader login needs clearly and wait for the user to scan when needed;
 - keep generated files under user-controlled local paths.
 

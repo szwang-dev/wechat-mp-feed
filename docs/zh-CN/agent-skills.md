@@ -8,23 +8,25 @@ skills/wechat-mp-feed/
 
 适用对象包括 Claude Code、Codex 风格 skill loader，以及其他可以注册 markdown workflow instructions 的 agent 系统。
 
-Skill 是项目的一等入口。CLI 负责执行，Skill 说明 agent 操作顺序：执行哪些命令、读取哪些输出、如何处理登录失效，以及如何从 feed 数据进入金融投研工作流。
+Skill 是 agent 使用项目的标准入口。CLI 负责执行，Skill 说明 agent 操作顺序：执行哪些命令、读取哪些输出、如何处理登录失效、如何管理单账号 intake 和订阅状态，以及如何从 feed 数据进入应用层工作流。
 
 ## Skill 做什么
 
-这个 skill 说明以下操作：
+该 Skill 说明以下操作：
 
 - 运行离线 feed 验证；
 - 从名单、截图、录屏或文章链接批量接入首次公众号列表；
 - 调用 `mpfeed run feed --config`；
 - 读取 feed 健康状态和失败表；
-- 导出文章级 LLM jobs；
-- 使用用户配置的本地路径保存公众号名单、录屏、downloader 凭据和数据库；
-- 在 feed 层之上构建金融研究 inbox / digest。
+- 执行两阶段语义 feed 工作流；
+- 导出文章级 LLM jobs 和最终应用层摘要上下文（digest context）；
+- 通过安全来源命令处理单账号 intake、分类确认、退订和重新启用；
+- 使用用户配置的本地路径保存公众号名单、录屏、下载服务凭据和数据库；
+- 在 feed 层之上构建应用层 inbox / 摘要（digest），包括内置金融投研工作流。
 
 ## Agent 操作约定
 
-使用这个 skill 的 agent 应当：
+使用该 Skill 的 agent 应当：
 
 - 把 `mpfeed` 作为主要操作入口；
 - 使用 `agent-smoke` 验证运行环境；
@@ -32,8 +34,10 @@ Skill 是项目的一等入口。CLI 负责执行，Skill 说明 agent 操作顺
 - 以审核后的来源库作为账号身份依据；
 - 基于 `feed-summary` 汇报 feed 健康状态；
 - 基于 `feed-failures` 判断重试范围；
-- 使用 article LLM jobs 执行文章语义分析；
-- downloader 登录失效时清楚提示扫码需求；
+- 使用分阶段 article LLM jobs 执行文章语义分析；
+- 最终报告需要原文证据时使用摘要上下文（`digest-context`）读取正文、结构化内容和图片资产；
+- 来源分类和订阅状态只通过 `mpfeed source` 安全写入口更新；
+- 下载服务登录失效时清楚提示扫码需求；
 - 把生成文件保存在用户控制的本地路径。
 
 ## 包结构

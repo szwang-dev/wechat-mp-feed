@@ -1,7 +1,7 @@
 [project]
 name = "wechat-mp-feed"
-version = "0.1.0"
-description = "Local-first toolkit for reviewable WeChat Official Account source management and article feed generation."
+version = "0.2.0"
+description = "Agent-first toolkit for reviewable WeChat Official Account source management, semantic feed generation, and domain-pack workflows."
 readme = "../../README.md"
 license = "Apache-2.0"
 requires-python = ">=3.9"

@@ -189,6 +189,18 @@ The table combines:
 
 This table is the expected handoff point for LLM-assisted first-run onboarding. The LLM should use account name, candidate intro, and latest article evidence before asking the user to confirm.
 
+## `collect`
+
+Collect article metadata and content.
+
+```bash
+mpfeed collect latest --tier core --count 10 --delay-min 3 --delay-max 8
+mpfeed collect history --tier all --days 90 --count 100 --max-sources 20 --delay-min 3 --delay-max 8
+mpfeed collect content --tier core --limit 20 --delay-min 3 --delay-max 8
+```
+
+`collect history` is the final stage after first-run onboarding or a large account-list import. It pages the downloader article-list API by `fakeid + begin/count`, saves metadata newer than the lookback window, and stops per source when it reaches the cutoff, downloader `total_count`, a short page, or the safety page cap. Use `--source-offset` and `--max-sources` for resumable batches.
+
 Compact review exports use a strict user-facing match policy: only `exact` and `normalized` names are shown as matched accounts. `similar`, `different`, and `unresolved` rows remain candidate accounts and require manual confirmation.
 
 Manual onboarding review should edit only the manual columns:
@@ -321,6 +333,8 @@ mpfeed --db ./data/mpfeed.sqlite run feed \
   --full \
   --max-sources 0 \
   --count 5 \
+  --refresh-mode incremental \
+  --incremental-max-pages 4 \
   --content-limit 0 \
   --work-dir ./work/feed
 ```
@@ -337,7 +351,10 @@ Important behavior:
 
 - `--full` refreshes article metadata, runs initial scoring, fetches retained content, then exports files.
 - `--skip-refresh` exports from existing SQLite rows without requiring downloader login.
+- `--refresh-mode latest` fetches one latest page per source. `--refresh-mode incremental` pages forward until the latest known local article is reached, or until `--incremental-max-pages` is hit.
+- `--count` is the downloader page size. For WeChat Official Accounts it can represent recent publish batches, and a batch can contain multiple article rows after normalization.
 - retained content fetches use a fixed queue and multiple internal passes.
+- `--progress-every N` emits progress lines during article metadata refresh and retained-content fetches. This is useful for scheduled jobs where long quiet periods can look like a hang.
 - body-level retry hints such as `请 N 秒后重试` are honored.
 - failed rows keep `fetch_error` so users can distinguish retryable limits from deleted or restricted articles.
 
@@ -377,6 +394,31 @@ Output:
 - writes `classifications`
 - supports rules first, LLM optional
 
+## `source`
+
+Agent-safe helpers for single-source status, taxonomy, confirmed classification, and latest-article refresh.
+
+```bash
+mpfeed source status --name "Example Research"
+mpfeed source set-status --name "Example Research" --status inactive
+mpfeed source taxonomy --taxonomy finance
+mpfeed source confirm-classification \
+  --name "Example Research" \
+  --category industrial \
+  --source-attribute kol \
+  --tags ai \
+  --confidence 0.78
+mpfeed source refresh-latest --name "Example Research" --count 5 --base-url http://127.0.0.1:5001
+```
+
+Behavior:
+
+- `source status` and `source taxonomy` are read-only.
+- `source set-status` is the agent-safe write path for subscription state. Use `inactive` for unsubscribe, `active` for explicit re-follow, `archived` for long-term removal, and `needs_review` when user confirmation is required.
+- `source confirm-classification` validates ids against the taxonomy, writes a confirmed source classification, and returns a readback payload.
+- `source refresh-latest` refreshes metadata for one active source.
+- Invalid taxonomy ids are rejected and should be returned to the user as suggestions, not written as formal classifications.
+
 ## `digest`
 
 Generate summaries and importance scores.
@@ -391,6 +433,22 @@ Output:
 - writes `digests`
 - can export markdown/json
 
+## `archive`
+
+Cache retained assets for high-value articles:
+
+```bash
+mpfeed archive assets --output-dir work/archive/assets --limit 100
+```
+
+Behavior:
+
+- selects image assets from articles whose `retention_level=full_archive`
+- downloads images to a local directory grouped by article id
+- updates `article_assets.local_path` and `download_status`
+- updates `articles.archive_status` to `cached`, `pending`, or `failed`
+- preserves image order through `article_assets.block_index` and `content_ref`
+
 ## `llm`
 
 Export agent-readable jobs and import LLM results.
@@ -398,16 +456,66 @@ Export agent-readable jobs and import LLM results.
 ```bash
 mpfeed llm export-jobs --entity-type all --output work/llm-jobs.json
 mpfeed llm export-jobs --entity-type article --limit 50 --content-chars 8000
+mpfeed llm export-jobs --entity-type article --article-content-scope metadata --output work/article-score-jobs.json
+mpfeed llm export-jobs --entity-type article --article-updated-after 2026-05-20T00:00:00+00:00 --output work/article-score-jobs.json
+mpfeed llm export-jobs --entity-type article --article-content-scope metadata --article-analysis-stage metadata --article-published-after 2026-05-11T00:00:00+08:00 --article-published-before 2026-05-17T23:59:59+08:00 --output work/article-metadata-jobs.json
+mpfeed llm export-jobs --entity-type article --article-content-scope content --article-analysis-stage content --article-retention content_or_archive --output work/article-content-jobs.json
+mpfeed llm export-jobs --entity-type source --source-article-limit 8 --output work/source-classification-jobs.json
+mpfeed llm export-jobs --entity-type source --source-id mp_xxx --source-article-limit 8 --output work/source-intake-job.json
 mpfeed llm import-results work/llm-results.json --model llm:codex
+mpfeed export digests --application-target weekly_report --analysis-stage content --min-score 0.6 --format markdown
+mpfeed export digest-context --application-target weekly_report --analysis-stage content --min-score 0.6 --format json
 ```
 
 Behavior:
 
 - exports sources/articles with the active taxonomy and a JSON result schema
-- lets any agent decide finance relevance, source tier/status, article category, tags, and digest
+- exports source jobs with recent article evidence for semantic account classification; `--source-id` limits the job to one account for single-source intake
+- exports article jobs for either metadata-only preliminary scoring or content-based semantic scoring
+- exports article jobs with an explicit `article_score_rubric`; agents should return `digest.score_breakdown` before the reference holistic `importance_score`
+- can limit article jobs with `--article-updated-after` so scheduled runs score only the current refresh batch instead of all historical articles
+- can limit article jobs by publish-time window and retention level with `--article-published-after`, `--article-published-before`, and `--article-retention`
+- can export digest packs by `application_targets`, score, and analysis stage using `mpfeed export digests`
+- can export final application context with `mpfeed export digest-context`, including the digest row, source article text, structured content, and image assets; final weekly reports or deep digests should read this context instead of relying only on second-level summaries
+- lets any agent decide finance relevance, source category, source attribute, source tier/status, article category, tags, digest, and semantic importance
+- validates imported category and tag ids against the selected taxonomy; unknown ids are skipped instead of written
+- saves first-time source LLM results as pending `source_classification_reviews` when `requires_user_confirmation=true`
 - imports classifications into `classifications`
 - imports source status/tier updates into `sources`
 - imports article summaries into `digests`
+
+`rules_v1` remains the local fallback for scoring and retention. For production agent workflows, prefer LLM-imported scores for article retention and digest priority. Article scoring uses the exported rubric fields: `research_depth`, `decision_value`, `strategy_reproducibility`, `timeliness`, `source_relevance`, `originality`, `evidence_quality`, and `noise_penalty`. Imports store the formula score computed from `digest.score_breakdown`; `digest.importance_score` is kept inside the breakdown as the agent's reference holistic score. The rubric is intentionally explicit so agents can be audited and the scoring policy can be revised later. Source attributes such as `sell_side`, `buy_side`, `media`, or `kol` can be returned either in `source_attribute` or in `classification.tags`; imports normalize them into tags. First-time source classification should set `requires_user_confirmation=true`; imports then save the suggestion as a pending source classification review. The user confirms it through the review workflow or `mpfeed source confirm-classification`, optionally with `--review-id` to mark the suggestion confirmed. If an agent needs a new source category, source attribute, or tag, it should use the closest current taxonomy id and return structured `taxonomy_suggestions` for user review.
+
+Article LLM scores are staged. `analysis_stage=metadata` is a preliminary score for content-fetch priority. `analysis_stage=content` is the final score for digest and retention. When both exist, content-stage scores take precedence over metadata-stage scores; `rules` scores are the fallback.
+
+## `run llm-feed`
+
+Advance the two-stage semantic feed workflow without hiding the LLM review boundary.
+
+```bash
+mpfeed run llm-feed \
+  --work-dir work/feed-llm \
+  --published-after 2026-05-11T00:00:00+08:00 \
+  --published-before 2026-05-17T23:59:59+08:00
+
+mpfeed run llm-feed \
+  --work-dir work/feed-llm \
+  --metadata-results work/feed-llm/article-metadata-results.json \
+  --fetch-content \
+  --base-url http://127.0.0.1:5001
+
+mpfeed run llm-feed \
+  --work-dir work/feed-llm \
+  --content-results work/feed-llm/article-content-results.json \
+  --digest-min-score 0.6
+```
+
+Behavior:
+
+- always writes `article-metadata-jobs.json`
+- after `--metadata-results`, imports metadata scores, optionally fetches retained content, and writes `article-content-jobs.json`
+- after `--content-results`, imports final content scores and writes digest packs under `digest-packs/`
+- keeps LLM execution outside the package so Codex, Claude Code, or another agent can complete the JSON jobs
 
 For first-run source onboarding, LLM jobs/results should decide:
 

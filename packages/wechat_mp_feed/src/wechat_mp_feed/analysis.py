@@ -74,6 +74,7 @@ def generate_article_digest(
         "importance_score": importance_score,
         "reason": reason,
         "model": RULE_METHOD,
+        "analysis_stage": "rules",
     }
 
 

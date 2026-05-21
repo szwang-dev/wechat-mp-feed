@@ -121,21 +121,43 @@
 | `confidence` | real | 0-1 置信度 |
 | `method` | text | `rules_v1`、`llm:<agent-or-model>`、`manual` |
 
+### `source_classification_reviews`
+
+首次 LLM 账号分类建议。用户确认前，这里只代表建议，不代表正式账号分类。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `id` | text pk | review id |
+| `source_id` | text fk | 对应来源 |
+| `taxonomy` | text | 使用的 taxonomy |
+| `category` | text | 最接近的现有账号主分类 |
+| `source_attribute` | text nullable | 最接近的现有来源属性 |
+| `tags` | json | 现有标签 id |
+| `confidence` | real | 0-1 置信度 |
+| `method` | text | `llm:<agent-or-model>` |
+| `reason` | text nullable | 推荐理由 |
+| `taxonomy_suggestions` | json | 建议新增的分类、来源属性或标签 |
+| `status` | text | `pending`、`confirmed`、`rejected` |
+| `raw_payload` | json nullable | 原始 LLM 结果 |
+
 ### `digests`
 
 摘要和评分结果。
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `id` | text pk | digest id |
+| `id` | text pk | 摘要 id |
 | `article_id` | text fk | 对应文章 |
 | `summary` | text | 摘要 |
 | `key_points` | json nullable | 要点 |
 | `importance_score` | real | 0-1 重要性分数 |
+| `score_breakdown` | json nullable | 评分 rubric 的分项分数 |
+| `application_targets` | json nullable | 后续应用路由，例如日度摘要、周报、策略池或风险监控 |
 | `reason` | text nullable | 重要性理由 |
 | `model` | text nullable | 模型或 agent 标识 |
+| `analysis_stage` | text | `metadata`、`content` 或 `rules` |
 
-`importance_score` 用于文章保存层级和 digest 选择。阈值应结合误收、漏收、存储成本和用户反馈持续调整。
+`importance_score` 用于文章保存层级和摘要（digest）选择。metadata 阶段分数用于正文抓取优先级，目标偏召回；系统根据公式分和确定性的低信号覆盖规则计算正文抓取动作，agent 不应自由返回 triage 决策。content 阶段分数用于最终摘要（digest）、路由和保存层级，并优先于 metadata 阶段分数。rules 分数作为 fallback。LLM 导入时，最终保存分数按 `score_breakdown` 公式计算，不直接信任自由综合分。`score_breakdown` 会保留分项评分、公式分和 agent 综合参考分，方便后续按误收、漏收、存储成本和用户反馈调整评分规则。`application_targets` 用于把文章路由到日度摘要、周报、策略池、市场观点、产业跟踪、风险监控、来源质量评估或忽略流程。
 
 ## 审核策略
 

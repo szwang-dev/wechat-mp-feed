@@ -131,6 +131,27 @@ Source/article category and tags.
 | `method` | text | `rules_v1`, `llm:<agent-or-model>`, `manual` |
 | `created_at` | timestamp | |
 
+### `source_classification_reviews`
+
+Pending LLM/account classification suggestions that require user confirmation before becoming formal source classifications.
+
+| column | type | notes |
+|---|---:|---|
+| `id` | text pk | review id |
+| `source_id` | text fk | sources.id |
+| `taxonomy` | text | selected taxonomy |
+| `category` | text | closest existing source category id |
+| `source_attribute` | text nullable | closest existing source attribute id |
+| `tags` | json | existing tag ids only |
+| `confidence` | real | 0-1 |
+| `method` | text | `llm:<agent-or-model>` |
+| `reason` | text nullable | user-facing rationale |
+| `taxonomy_suggestions` | json | proposed new category/attribute/tag items |
+| `status` | text | `pending`, `confirmed`, `rejected` |
+| `raw_payload` | json nullable | original LLM result |
+| `created_at` | timestamp | |
+| `updated_at` | timestamp | |
+
 ### `digests`
 
 Summaries and scoring results.
@@ -142,11 +163,14 @@ Summaries and scoring results.
 | `summary` | text | |
 | `key_points` | json nullable | bullet points |
 | `importance_score` | real | 0-1 |
+| `score_breakdown` | json nullable | rubric sub-scores used to derive the importance score |
+| `application_targets` | json nullable | downstream routing targets such as daily digest, weekly report, strategy backlog, or risk monitoring |
 | `reason` | text nullable | why it matters |
 | `model` | text nullable | model/provider label |
+| `analysis_stage` | text | `metadata`, `content`, or `rules` |
 | `created_at` | timestamp | |
 
-`importance_score` drives article retention. Default thresholds are expected to evolve; monitor digest/archive false positives, missed useful articles, storage cost, and user feedback before changing them.
+`importance_score` drives article retention. Metadata-stage scores prioritize content fetches and should favor recall. The system computes metadata-stage fetch actions from the formula score plus deterministic low-signal overrides, so agents should not return free-form triage decisions. Content-stage scores take precedence for final digest, routing, and retention. Rules scores are a fallback. For LLM imports, the stored score is computed from `score_breakdown` rather than trusting a free-form holistic score. `score_breakdown` keeps the rubric evidence, the computed score, and the agent's reference holistic score so scoring rules can be reviewed and adjusted later. `application_targets` route content-stage articles into daily digest, weekly report, strategy backlog, market view, industry tracking, risk monitoring, source-quality review, or ignore workflows. Default thresholds are expected to evolve; monitor digest/archive false positives, missed useful articles, storage cost, and user feedback before changing them.
 
 ### `delivery_logs`
 
@@ -170,6 +194,7 @@ Push/export history.
 - `articles(url)` unique
 - `source_candidates(import_id, score)`
 - `classifications(entity_type, entity_id, taxonomy)`
+- `source_classification_reviews(source_id, taxonomy, status)`
 
 ## Review policy
 

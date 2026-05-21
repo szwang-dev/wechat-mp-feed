@@ -26,11 +26,11 @@ from wechat_mp_feed.media_import import clean_account_names, normalize_crop_filt
 from wechat_mp_feed.name_match import names_equivalent, search_query_variants
 from wechat_mp_feed.onboarding import latest_probe_article
 from wechat_mp_feed.policy import retryable_status, tier_policy
-from wechat_mp_feed.retention import retention_decision_for_score
+from wechat_mp_feed.retention import metadata_triage_decision, retention_decision_for_score
 from wechat_mp_feed.storage import Store
 from wechat_mp_feed.taxonomy import load_taxonomy
 from wechat_mp_feed.wechat_url import parse_article_url
-from wechat_mp_feed.llm_jobs import build_onboarding_llm_jobs
+from wechat_mp_feed.llm_jobs import build_llm_jobs, build_onboarding_llm_jobs
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -151,6 +151,38 @@ class MVPTest(unittest.TestCase):
         high = retention_decision_for_score(0.82)
         self.assertEqual(high.retention_level, "full_archive")
         self.assertEqual(high.archive_status, "pending")
+
+    def test_metadata_triage_uses_score_with_hard_noise_override(self):
+        self.assertEqual(
+            metadata_triage_decision(0.82, title="金融招聘 | 某基金社招岗位", source_name="金融圈招聘"),
+            "metadata_only",
+        )
+        self.assertEqual(
+            metadata_triage_decision(0.62, title="行业轮动周报：风格扩散", source_name="量化研究"),
+            "fetch_required",
+        )
+        self.assertEqual(
+            metadata_triage_decision(0.48, title="政策双周报：关注财政节奏", source_name="固收研究"),
+            "fetch_candidate",
+        )
+        self.assertEqual(
+            retention_decision_for_score(
+                0.82,
+                analysis_stage="metadata",
+                title="金融招聘 | 某基金社招岗位",
+                source_name="金融圈招聘",
+            ).retention_level,
+            "metadata",
+        )
+        self.assertEqual(
+            retention_decision_for_score(
+                0.82,
+                analysis_stage="metadata",
+                title="行业轮动周报：风格扩散",
+                source_name="量化研究",
+            ).retention_level,
+            "content",
+        )
 
     def test_cli_import_video_uses_ocr_result(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1035,6 +1067,48 @@ class MVPTest(unittest.TestCase):
             self.assertEqual(articles[0]["source_id"], accepted["source_id"])
             self.assertEqual(articles[0]["title"], "市场观察")
 
+    def test_cli_collect_history_backfills_recent_metadata(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "mpfeed.sqlite"
+            store = Store(db_path)
+            store.init()
+            saved = store.save_search_candidates(
+                "示例策略研究",
+                [{"candidate_name": "示例策略研究", "wechat_fakeid": "fake_004", "score": 0.9, "raw_payload": {}}],
+                {"items": []},
+            )
+            store.accept_candidate(saved["items"][0]["id"], tier="core")
+
+            with patch("wechat_mp_feed.adapters.http.urlopen", side_effect=_fake_urlopen), redirect_stdout(StringIO()) as stdout:
+                exit_code = main(
+                    [
+                        "--db",
+                        str(db_path),
+                        "collect",
+                        "history",
+                        "--base-url",
+                        "http://example.test",
+                        "--tier",
+                        "core",
+                        "--days",
+                        "10000",
+                        "--max-sources",
+                        "1",
+                        "--max-pages-per-source",
+                        "2",
+                        "--no-delay",
+                    ]
+                )
+            payload = json.loads(stdout.getvalue())
+            articles = store.list_articles()
+
+            self.assertEqual(exit_code, 0)
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["totals"]["sources_ok"], 1)
+            self.assertEqual(payload["totals"]["articles_upserted"], 1)
+            self.assertEqual(payload["results"][0]["stop_reason"], "short_page")
+            self.assertEqual(articles[0]["title"], "市场观察")
+
     def test_feed_export_includes_source_and_content_status(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "mpfeed.sqlite"
@@ -1184,6 +1258,102 @@ class MVPTest(unittest.TestCase):
             self.assertIsNone(offline_payload["service"])
             self.assertIsNone(offline_payload["refreshed"])
             self.assertEqual(offline_payload["outputs"]["feed_rows"], 1)
+
+    def test_cli_run_feed_incremental_pages_until_known_article(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "mpfeed.sqlite"
+            feed_output = Path(temp_dir) / "feed-items.csv"
+            summary_output = Path(temp_dir) / "feed-summary.json"
+            store = Store(db_path)
+            store.init()
+            saved = store.save_search_candidates(
+                "示例策略研究",
+                [{"candidate_name": "示例策略研究", "wechat_fakeid": "fake_004", "score": 0.92, "raw_payload": {}}],
+                {"items": []},
+            )
+            accepted = store.accept_candidate(saved["items"][0]["id"], tier="core")
+            store.upsert_articles(
+                accepted["source_id"],
+                [
+                    {
+                        "title": "已知旧文章",
+                        "url": "https://mp.weixin.qq.com/s/known",
+                        "publish_time": "2026-05-18T00:00:00+00:00",
+                    }
+                ],
+            )
+
+            def fake_incremental_urlopen(request, timeout):
+                from urllib.parse import parse_qs, urlparse
+
+                url = request.full_url
+                if url.endswith("/api/health"):
+                    return _FakeResponse({"status": "ok"})
+                if url.endswith("/api/admin/status"):
+                    return _FakeResponse({"logged_in": True})
+                if "/api/public/articles?" in url:
+                    begin = int(parse_qs(urlparse(url).query).get("begin", ["0"])[0])
+                    if begin == 0:
+                        return _FakeResponse(
+                            {
+                                "data": {
+                                    "articles": [
+                                        {
+                                            "title": "新增文章",
+                                            "link": "https://mp.weixin.qq.com/s/new",
+                                            "create_time": 1779076800,
+                                        }
+                                    ]
+                                }
+                            }
+                        )
+                    if begin == 1:
+                        return _FakeResponse(
+                            {
+                                "data": {
+                                    "articles": [
+                                        {
+                                            "title": "已知旧文章",
+                                            "link": "https://mp.weixin.qq.com/s/known",
+                                            "create_time": 1778990400,
+                                        }
+                                    ]
+                                }
+                            }
+                        )
+                    raise AssertionError(f"unexpected incremental page: {begin}")
+                raise AssertionError(f"unexpected URL: {url}")
+
+            with patch("wechat_mp_feed.adapters.http.urlopen", side_effect=fake_incremental_urlopen), redirect_stdout(StringIO()) as stdout:
+                exit_code = main(
+                    [
+                        "--db",
+                        str(db_path),
+                        "run",
+                        "feed",
+                        "--base-url",
+                        "http://example.test",
+                        "--refresh-mode",
+                        "incremental",
+                        "--count",
+                        "1",
+                        "--incremental-max-pages",
+                        "5",
+                        "--feed-output",
+                        str(feed_output),
+                        "--summary-output",
+                        str(summary_output),
+                        "--no-delay",
+                    ]
+                )
+            payload = json.loads(stdout.getvalue())
+            articles = Store(db_path).list_articles()
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(payload["refreshed"]["results"][0]["pages_fetched"], 2)
+            self.assertEqual(payload["refreshed"]["results"][0]["stop_reason"], "boundary_url_reached")
+            self.assertEqual(len(articles), 2)
+            self.assertEqual(articles[0]["title"], "新增文章")
 
     def test_cli_run_feed_reads_config_and_exports_failures(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1366,6 +1536,87 @@ class MVPTest(unittest.TestCase):
             self.assertEqual(assets[0]["block_index"], 1)
             self.assertEqual(assets[0]["content_ref"], "block:1")
             self.assertEqual(articles[0]["crawl_status"], "content_ok")
+
+    def test_cli_archive_assets_caches_full_archive_images(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "mpfeed.sqlite"
+            archive_dir = Path(temp_dir) / "asset-cache"
+            store = Store(db_path)
+            store.init()
+            source = store.upsert_source(
+                name="Archive Test",
+                wechat_fakeid="fake_archive",
+                status="active",
+                tier="core",
+                source_type="test",
+            )
+            article = store.upsert_articles(
+                source["source_id"],
+                [
+                    {
+                        "title": "深度研究",
+                        "url": "https://mp.weixin.qq.com/s?__biz=MzA123&mid=91",
+                        "raw_payload": {},
+                    }
+                ],
+            )["items"][0]
+            store.upsert_article_content(
+                article["id"],
+                {
+                    "content_html": '<p>图表</p><img data-src="https://example.test/chart.png"/>',
+                    "content_text": "图表正文",
+                    "content_structure": [
+                        {"type": "text", "text": "图表"},
+                        {"type": "image", "url": "https://example.test/chart.png"},
+                    ],
+                    "assets": [{"asset_type": "image", "url": "https://example.test/chart.png", "metadata": {}}],
+                },
+            )
+            store.save_digest(
+                {
+                    "article_id": article["id"],
+                    "summary": "重要深度研究",
+                    "key_points": ["图表"],
+                    "importance_score": 0.9,
+                    "reason": "archive",
+                    "model": "llm:test",
+                    "analysis_stage": "content",
+                }
+            )
+
+            class _AssetResponse:
+                headers = {"Content-Type": "image/png"}
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    return None
+
+                def read(self):
+                    return b"png-bytes"
+
+            with patch("wechat_mp_feed.assets.urlopen", return_value=_AssetResponse()), redirect_stdout(StringIO()) as stdout:
+                exit_code = main(
+                    [
+                        "--db",
+                        str(db_path),
+                        "archive",
+                        "assets",
+                        "--output-dir",
+                        str(archive_dir),
+                    ]
+                )
+            payload = json.loads(stdout.getvalue())
+            refreshed = Store(db_path)
+            assets = refreshed.list_article_assets(article["id"])
+            articles = refreshed.list_articles()
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(payload["assets_cached"], 1)
+            self.assertEqual(assets[0]["download_status"], "cached")
+            self.assertTrue(Path(assets[0]["local_path"]).exists())
+            self.assertEqual(articles[0]["archive_status"], "cached")
 
     def test_review_import_classified_sources_imports_reviewed_rows(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1728,6 +1979,7 @@ class MVPTest(unittest.TestCase):
     def test_retry_policy(self):
         self.assertTrue(retryable_status({"ok": False, "status": 429}))
         self.assertTrue(retryable_status({"ok": False, "status": 500}))
+        self.assertTrue(retryable_status({"ok": False, "status": 0, "body": {"error": "Network is unreachable"}}))
         self.assertTrue(retryable_status({"ok": False, "status": 200, "body": {"error": "Rate limited: 文章获取过快，请3秒后重试"}}))
         self.assertFalse(retryable_status({"ok": False, "status": 404}))
 
@@ -1746,6 +1998,32 @@ class MVPTest(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(len(calls), 2)
         sleep.assert_called_once()
+
+    def test_with_retries_converts_network_exception_to_retryable_payload(self):
+        calls = []
+
+        def call():
+            calls.append(1)
+            if len(calls) == 1:
+                raise ConnectionError("HTTP request failed: [Errno 101] Network is unreachable")
+            return {"ok": True, "status": 200}
+
+        with patch("wechat_mp_feed.cli.time.sleep"):
+            result = with_retries(call, retries=1, backoff_seconds=0.1)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(calls), 2)
+
+    def test_with_retries_returns_network_exception_payload_after_retries(self):
+        def call():
+            raise ConnectionError("HTTP request failed: [Errno 101] Network is unreachable")
+
+        with patch("wechat_mp_feed.cli.time.sleep"):
+            result = with_retries(call, retries=1, backoff_seconds=0.1)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], 0)
+        self.assertEqual(result["body"]["exception_type"], "ConnectionError")
 
     def test_with_retries_honors_body_retry_after_seconds(self):
         calls = []
@@ -1801,11 +2079,67 @@ class MVPTest(unittest.TestCase):
                 no_delay=True,
             )
 
-        self.assertEqual(result["articles_seen"], 1)
-        self.assertEqual(result["attempts"], 2)
-        self.assertEqual(result["content_ok"], 1)
-        self.assertEqual(result["content_failed"], 0)
-        self.assertEqual([item["remaining"] for item in result["passes"]], [1, 0])
+            self.assertEqual(result["articles_seen"], 1)
+            self.assertEqual(result["attempts"], 2)
+            self.assertEqual(result["content_ok"], 1)
+            self.assertEqual(result["content_failed"], 0)
+            self.assertEqual(result["sample_results"][0]["retry_after_seconds"], 1.8)
+            self.assertEqual([item["remaining"] for item in result["passes"]], [1, 0])
+
+    def test_content_fetch_queue_prioritizes_importance_before_recency(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = Store(Path(temp_dir) / "mpfeed.sqlite")
+            store.init()
+            saved = store.save_search_candidates(
+                "策略研究",
+                [{"candidate_name": "策略研究", "wechat_fakeid": "fake_005", "score": 0.92, "raw_payload": {}}],
+                {"items": []},
+            )
+            accepted = store.accept_candidate(saved["items"][0]["id"], tier="core")
+            inserted = store.upsert_articles(
+                accepted["source_id"],
+                [
+                    {
+                        "title": "旧但重要的配置框架",
+                        "url": "https://mp.weixin.qq.com/s/old-important",
+                        "publish_time": "2026-05-10T00:00:00+00:00",
+                        "raw_payload": {},
+                    },
+                    {
+                        "title": "新但一般的日评",
+                        "url": "https://mp.weixin.qq.com/s/new-normal",
+                        "publish_time": "2026-05-19T00:00:00+00:00",
+                        "raw_payload": {},
+                    },
+                ],
+            )
+            old_important_id = inserted["items"][0]["id"]
+            new_normal_id = inserted["items"][1]["id"]
+            store.save_digest(
+                {
+                    "article_id": old_important_id,
+                    "summary": "旧文重要",
+                    "key_points": ["框架"],
+                    "importance_score": 0.82,
+                    "reason": "framework",
+                    "model": "rules:test",
+                }
+            )
+            store.save_digest(
+                {
+                    "article_id": new_normal_id,
+                    "summary": "新文一般",
+                    "key_points": ["日评"],
+                    "importance_score": 0.5,
+                    "reason": "commentary",
+                    "model": "rules:test",
+                }
+            )
+
+            queue = store.list_articles_for_content_fetch(limit=2, retention_levels=("content", "full_archive"))
+
+        self.assertEqual([row["id"] for row in queue], [old_important_id, new_normal_id])
+        self.assertEqual(queue[0]["importance_score"], 0.82)
 
     def test_adapter_error_message_preserves_body_error(self):
         self.assertEqual(
@@ -1813,6 +2147,106 @@ class MVPTest(unittest.TestCase):
             "Rate limited: 文章获取过快，请3秒后重试",
         )
         self.assertEqual(adapter_error_message({"ok": False, "status": 502, "body": {}}), "adapter_status_502")
+
+    def test_cli_source_agent_safe_helpers(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "mpfeed.sqlite"
+            store = Store(db_path)
+            store.init()
+            source = store.upsert_source(
+                name="Agent API Test",
+                wechat_fakeid="fake_agent_api",
+                status="active",
+                tier="normal",
+                source_type="test",
+            )
+
+            with redirect_stdout(StringIO()) as stdout:
+                exit_code = main(["--db", str(db_path), "source", "status", "--name", "Agent API Test"])
+            status_payload = json.loads(stdout.getvalue())
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(status_payload["status"], "source_status")
+            self.assertEqual(status_payload["source"]["id"], source["source_id"])
+
+            with redirect_stdout(StringIO()) as stdout:
+                exit_code = main(["source", "taxonomy"])
+            taxonomy_payload = json.loads(stdout.getvalue())
+            category_ids = {item["id"] for item in taxonomy_payload["taxonomy"]["source_categories"]}
+
+            self.assertEqual(exit_code, 0)
+            self.assertIn("industrial", category_ids)
+            self.assertNotIn("technology_business", category_ids)
+
+            with redirect_stdout(StringIO()) as stdout:
+                exit_code = main(
+                    [
+                        "--db",
+                        str(db_path),
+                        "source",
+                        "confirm-classification",
+                        "--name",
+                        "Agent API Test",
+                        "--category",
+                        "industrial",
+                        "--source-attribute",
+                        "kol",
+                        "--tags",
+                        "ai",
+                        "--confidence",
+                        "0.78",
+                    ]
+                )
+            confirmed = json.loads(stdout.getvalue())
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(confirmed["status"], "classification_confirmed")
+            self.assertEqual(confirmed["readback"]["category"], "industrial")
+            self.assertEqual(confirmed["readback"]["tags"], ["kol", "ai"])
+
+            with redirect_stdout(StringIO()) as stdout:
+                exit_code = main(
+                    [
+                        "--db",
+                        str(db_path),
+                        "source",
+                        "confirm-classification",
+                        "--name",
+                        "Agent API Test",
+                        "--category",
+                        "technology_business",
+                        "--source-attribute",
+                        "product_observer",
+                        "--tags",
+                        "ai_tool",
+                    ]
+                )
+            rejected = json.loads(stdout.getvalue())
+            readback = Store(db_path).list_classifications(entity_type="source", taxonomy="finance")
+
+            self.assertEqual(exit_code, 2)
+            self.assertEqual(rejected["status"], "classification_validation_failed")
+            self.assertIn("invalid_category:technology_business", rejected["validation"]["errors"])
+            self.assertEqual(len(readback), 1)
+            self.assertEqual(readback[0]["category"], "industrial")
+
+            with redirect_stdout(StringIO()) as stdout:
+                exit_code = main(
+                    [
+                        "--db",
+                        str(db_path),
+                        "source",
+                        "refresh-latest",
+                        "--name",
+                        "Agent API Test",
+                        "--count",
+                        "0",
+                    ]
+                )
+            refreshed = json.loads(stdout.getvalue())
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(refreshed["latest_articles"]["status"], "skipped_by_article_count")
 
     def test_rule_classification_and_digest_flow(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1906,6 +2340,8 @@ class MVPTest(unittest.TestCase):
             self.assertEqual(exported["count"], 2)
             self.assertEqual(jobs["count"], 2)
             self.assertEqual({job["entity_type"] for job in jobs["jobs"]}, {"source", "article"})
+            source_job = next(job for job in jobs["jobs"] if job["entity_type"] == "source")
+            self.assertEqual(source_job["source"]["latest_articles"][0]["title"], "银行财报点评：息差企稳")
 
             results_path.write_text(
                 json.dumps(
@@ -1917,10 +2353,11 @@ class MVPTest(unittest.TestCase):
                                 "entity_id": accepted["source_id"],
                                 "classification": {
                                     "category": "company_research",
-                                    "tags": ["sell_side", "banks"],
+                                    "tags": ["banks"],
                                     "confidence": 0.88,
                                     "method": "llm:test",
                                 },
+                                "source_attribute": "sell_side",
                                 "source_update": {"status": "active", "tier": "core"},
                             },
                             {
@@ -1937,6 +2374,17 @@ class MVPTest(unittest.TestCase):
                                     "summary": "银行业绩与息差改善，值得跟踪。",
                                     "key_points": ["息差企稳", "资产质量改善"],
                                     "importance_score": 0.82,
+                                    "score_breakdown": {
+                                        "research_depth": 0.9,
+                                        "decision_value": 0.95,
+                                        "strategy_reproducibility": 0.8,
+                                        "timeliness": 0.9,
+                                        "source_relevance": 0.95,
+                                        "originality": 0.75,
+                                        "evidence_quality": 0.9,
+                                        "noise_penalty": 0,
+                                    },
+                                    "application_targets": ["daily_digest", "weekly_report", "ignore", "unknown_target"],
                                     "reason": "金融研究高相关。",
                                     "model": "llm:test",
                                 },
@@ -1957,9 +2405,467 @@ class MVPTest(unittest.TestCase):
             self.assertEqual(imported["classifications_saved"], 2)
             self.assertEqual(imported["digests_saved"], 1)
             self.assertEqual(refreshed.list_sources()[0]["tier"], "core")
+            self.assertIn("sell_side", refreshed.list_classifications(entity_type="source")[0]["tags"])
             self.assertEqual(refreshed.list_digests()[0]["summary"], "银行业绩与息差改善，值得跟踪。")
+            self.assertEqual(refreshed.list_digests()[0]["importance_score"], 0.872)
+            self.assertEqual(refreshed.list_digests()[0]["score_breakdown"]["decision_value"], 0.95)
+            self.assertEqual(refreshed.list_digests()[0]["score_breakdown"]["model_importance_score"], 0.82)
+            self.assertEqual(refreshed.list_digests()[0]["score_breakdown"]["computed_importance_score"], 0.872)
+            self.assertEqual(refreshed.list_digests()[0]["application_targets"], ["daily_digest", "weekly_report", "ignore"])
             self.assertEqual(refreshed.list_articles()[0]["retention_level"], "full_archive")
             self.assertEqual(refreshed.list_articles()[0]["archive_status"], "pending")
+
+    def test_llm_article_jobs_can_export_metadata_before_content_fetch(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "mpfeed.sqlite"
+            store = Store(db_path)
+            store.init()
+            saved = store.save_search_candidates(
+                "量化研究",
+                [{"candidate_name": "量化研究", "wechat_fakeid": "fake_quant", "score": 0.95, "raw_payload": {}}],
+                {"items": []},
+            )
+            accepted = store.accept_candidate(saved["items"][0]["id"], tier="normal")
+            store.upsert_articles(
+                accepted["source_id"],
+                [
+                    {
+                        "title": "行业轮动周报：风格继续扩散",
+                        "url": "https://mp.weixin.qq.com/s?__biz=MzA123&mid=31",
+                        "digest": "行业轮动和市场择时观点。",
+                        "raw_payload": {},
+                    }
+                ],
+            )
+
+            payload = build_llm_jobs(
+                store=store,
+                taxonomy=load_taxonomy(FINANCE_TAXONOMY),
+                entity_type="article",
+                article_content_scope="metadata",
+            )
+
+            self.assertEqual(payload["count"], 1)
+            self.assertEqual(payload["jobs"][0]["article"]["title"], "行业轮动周报：风格继续扩散")
+            self.assertNotIn("content_excerpt", payload["jobs"][0]["article"])
+            self.assertIn("score_breakdown", payload["jobs"][0]["expected_result"]["digest.required"])
+            self.assertIn("article_score_rubric", payload)
+            self.assertIn("article_metadata_score_rubric", payload)
+            self.assertIn("article_application_targets", payload)
+
+            future_payload = build_llm_jobs(
+                store=store,
+                taxonomy=load_taxonomy(FINANCE_TAXONOMY),
+                entity_type="article",
+                article_content_scope="metadata",
+                article_updated_after="2999-01-01T00:00:00+00:00",
+            )
+
+            self.assertEqual(future_payload["count"], 0)
+
+    def test_llm_article_jobs_filter_by_publish_time_retention_and_stage(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "mpfeed.sqlite"
+            store = Store(db_path)
+            store.init()
+            saved = store.save_search_candidates(
+                "量化研究",
+                [{"candidate_name": "量化研究", "wechat_fakeid": "fake_quant_filter", "score": 0.95, "raw_payload": {}}],
+                {"items": []},
+            )
+            accepted = store.accept_candidate(saved["items"][0]["id"], tier="normal")
+            inserted = store.upsert_articles(
+                accepted["source_id"],
+                [
+                    {
+                        "title": "行业轮动周报：风格继续扩散",
+                        "url": "https://mp.weixin.qq.com/s/filter-a",
+                        "digest": "行业轮动和市场择时观点。",
+                        "publish_time": "2026-05-12T00:00:00+00:00",
+                        "raw_payload": {},
+                    },
+                    {
+                        "title": "较晚发布的策略观点",
+                        "url": "https://mp.weixin.qq.com/s/filter-b",
+                        "digest": "策略观点。",
+                        "publish_time": "2026-05-20T00:00:00+00:00",
+                        "raw_payload": {},
+                    },
+                ],
+            )
+            for item in inserted["items"]:
+                store.save_digest(
+                    {
+                        "article_id": item["id"],
+                        "summary": "metadata score",
+                        "key_points": ["score"],
+                        "importance_score": 0.8,
+                        "score_breakdown": {
+                            "title_research_signal": 1.0,
+                            "source_relevance": 1.0,
+                            "abstract_specificity": 1.0,
+                            "followup_potential": 1.0,
+                            "freshness": 1.0,
+                            "evidence_quality": 1.0,
+                            "noise_penalty": 0.0,
+                        },
+                        "reason": "metadata",
+                        "model": "llm:test",
+                        "analysis_stage": "metadata",
+                    }
+                )
+
+            payload = build_llm_jobs(
+                store=store,
+                taxonomy=load_taxonomy(FINANCE_TAXONOMY),
+                entity_type="article",
+                article_content_scope="metadata",
+                article_published_after="2026-05-11T00:00:00+00:00",
+                article_published_before="2026-05-18T00:00:00+00:00",
+                article_retention_levels=("content",),
+                article_analysis_stage="metadata",
+            )
+
+            self.assertEqual(payload["count"], 1)
+            self.assertEqual(payload["jobs"][0]["analysis_stage"], "metadata")
+            self.assertEqual(payload["jobs"][0]["article"]["title"], "行业轮动周报：风格继续扩散")
+            self.assertEqual(payload["article_job_filter"]["retention_levels"], ["content"])
+            self.assertEqual(payload["article_job_filter"]["published_before"], "2026-05-18T00:00:00+00:00")
+
+    def test_list_digests_filters_by_application_target_score_and_stage(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = Store(Path(temp_dir) / "mpfeed.sqlite")
+            store.init()
+            saved = store.save_search_candidates(
+                "策略研究",
+                [{"candidate_name": "策略研究", "wechat_fakeid": "fake_digest_filter", "score": 0.95, "raw_payload": {}}],
+                {"items": []},
+            )
+            accepted = store.accept_candidate(saved["items"][0]["id"], tier="core")
+            inserted = store.upsert_articles(
+                accepted["source_id"],
+                [
+                    {"title": "周报材料", "url": "https://mp.weixin.qq.com/s/digest-weekly", "raw_payload": {}},
+                    {"title": "低分材料", "url": "https://mp.weixin.qq.com/s/digest-low", "raw_payload": {}},
+                ],
+            )
+            store.save_digest(
+                {
+                    "article_id": inserted["items"][0]["id"],
+                    "summary": "高质量周报材料",
+                    "key_points": ["策略"],
+                    "importance_score": 0.82,
+                    "application_targets": ["weekly_report", "strategy_backlog"],
+                    "reason": "useful",
+                    "model": "llm:test",
+                    "analysis_stage": "content",
+                }
+            )
+            store.save_digest(
+                {
+                    "article_id": inserted["items"][1]["id"],
+                    "summary": "低分日常材料",
+                    "key_points": ["日常"],
+                    "importance_score": 0.3,
+                    "application_targets": ["weekly_report"],
+                    "reason": "routine",
+                    "model": "llm:test",
+                    "analysis_stage": "content",
+                }
+            )
+
+            rows = store.list_digests(application_target="weekly_report", min_score=0.6, analysis_stage="content")
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["title"], "周报材料")
+        self.assertEqual(rows[0]["application_targets"], ["weekly_report", "strategy_backlog"])
+
+    def test_export_digest_context_includes_article_content_and_assets(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "mpfeed.sqlite"
+            store = Store(db_path)
+            store.init()
+            saved = store.save_search_candidates(
+                "策略研究",
+                [{"candidate_name": "策略研究", "wechat_fakeid": "fake_digest_context", "score": 0.95, "raw_payload": {}}],
+                {"items": []},
+            )
+            accepted = store.accept_candidate(saved["items"][0]["id"], tier="core")
+            inserted = store.upsert_articles(
+                accepted["source_id"],
+                [{"title": "行业轮动深度", "url": "https://mp.weixin.qq.com/s/context", "raw_payload": {}}],
+            )
+            article_id = inserted["items"][0]["id"]
+            store.upsert_article_content(
+                article_id,
+                {
+                    "content_text": "原文正文，包含行业轮动观点。",
+                    "content_markdown": "原文正文，包含行业轮动观点。",
+                    "content_structure": [
+                        {"type": "paragraph", "text": "原文正文，包含行业轮动观点。"},
+                        {"type": "image", "url": "https://img.example/chart.png"},
+                    ],
+                    "assets": [
+                        {
+                            "asset_type": "image",
+                            "url": "https://img.example/chart.png",
+                            "block_index": 1,
+                            "content_ref": "block:1",
+                        }
+                    ],
+                },
+            )
+            store.save_digest(
+                {
+                    "article_id": article_id,
+                    "summary": "行业轮动摘要",
+                    "key_points": ["轮动"],
+                    "importance_score": 0.81,
+                    "application_targets": ["weekly_report"],
+                    "reason": "deep research",
+                    "model": "llm:test",
+                    "analysis_stage": "content",
+                }
+            )
+
+            with redirect_stdout(StringIO()) as stdout:
+                exit_code = main(
+                    [
+                        "--db",
+                        str(db_path),
+                        "export",
+                        "digest-context",
+                        "--application-target",
+                        "weekly_report",
+                        "--analysis-stage",
+                        "content",
+                        "--min-score",
+                        "0.6",
+                    ]
+                )
+            rows = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["digest"]["summary"], "行业轮动摘要")
+        self.assertEqual(rows[0]["article"]["content_text"], "原文正文，包含行业轮动观点。")
+        self.assertEqual(rows[0]["article"]["content_structure"][1]["type"], "image")
+        self.assertEqual(rows[0]["assets"][0]["content_ref"], "block:1")
+
+    def test_source_set_status_updates_source_through_cli(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "mpfeed.sqlite"
+            store = Store(db_path)
+            store.init()
+            saved = store.save_search_candidates(
+                "科技观察",
+                [{"candidate_name": "科技观察", "wechat_fakeid": "fake_status", "score": 0.95, "raw_payload": {}}],
+                {"items": []},
+            )
+            accepted = store.accept_candidate(saved["items"][0]["id"], tier="normal")
+
+            with redirect_stdout(StringIO()) as stdout:
+                exit_code = main(
+                    [
+                        "--db",
+                        str(db_path),
+                        "source",
+                        "set-status",
+                        "--source-id",
+                        accepted["source_id"],
+                        "--status",
+                        "inactive",
+                    ]
+                )
+            payload = json.loads(stdout.getvalue())
+            source = Store(db_path).get_source(accepted["source_id"])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["status"], "source_status_updated")
+        self.assertEqual(payload["source"]["status"], "inactive")
+        self.assertEqual(source["status"], "inactive")
+
+    def test_run_llm_feed_exports_metadata_jobs(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "mpfeed.sqlite"
+            work_dir = Path(temp_dir) / "feed-llm"
+            store = Store(db_path)
+            store.init()
+            saved = store.save_search_candidates(
+                "策略研究",
+                [{"candidate_name": "策略研究", "wechat_fakeid": "fake_llm_feed", "score": 0.95, "raw_payload": {}}],
+                {"items": []},
+            )
+            accepted = store.accept_candidate(saved["items"][0]["id"], tier="core")
+            store.upsert_articles(
+                accepted["source_id"],
+                [
+                    {
+                        "title": "行业轮动周报",
+                        "url": "https://mp.weixin.qq.com/s/llm-feed",
+                        "digest": "行业轮动观点。",
+                        "publish_time": "2026-05-12T00:00:00+00:00",
+                        "raw_payload": {},
+                    }
+                ],
+            )
+
+            with redirect_stdout(StringIO()) as stdout:
+                exit_code = main(
+                    [
+                        "--db",
+                        str(db_path),
+                        "run",
+                        "llm-feed",
+                        "--work-dir",
+                        str(work_dir),
+                        "--published-after",
+                        "2026-05-11T00:00:00+00:00",
+                        "--published-before",
+                        "2026-05-17T23:59:59+00:00",
+                    ]
+                )
+
+            payload = json.loads(stdout.getvalue())
+            jobs_path = Path(payload["outputs"]["metadata_jobs"])
+            jobs = json.loads(jobs_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["outputs"]["metadata_jobs_count"], 1)
+        self.assertEqual(jobs["jobs"][0]["analysis_stage"], "metadata")
+        self.assertIn("--metadata-results", payload["next_steps"][0])
+
+    def test_llm_import_rejects_unknown_taxonomy_ids(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "mpfeed.sqlite"
+            results_path = Path(temp_dir) / "llm-results.json"
+            store = Store(db_path)
+            store.init()
+            saved = store.save_search_candidates(
+                "科技观察",
+                [{"candidate_name": "科技观察", "wechat_fakeid": "fake_tech", "score": 0.95, "raw_payload": {}}],
+                {"items": []},
+            )
+            accepted = store.accept_candidate(saved["items"][0]["id"], tier="normal")
+
+            results_path.write_text(
+                json.dumps(
+                    {
+                        "results": [
+                            {
+                                "entity_type": "source",
+                                "entity_id": accepted["source_id"],
+                                "classification": {
+                                    "category": "technology_business",
+                                    "tags": ["ai_tool"],
+                                    "confidence": 0.82,
+                                    "method": "llm:test",
+                                },
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            with redirect_stdout(StringIO()) as stdout:
+                exit_code = main(["--db", str(db_path), "llm", "import-results", str(results_path)])
+            imported = json.loads(stdout.getvalue())
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(imported["classifications_saved"], 0)
+            self.assertEqual(imported["skipped"][0]["reason"], "invalid_category:technology_business")
+            self.assertEqual(Store(db_path).list_classifications(), [])
+
+    def test_llm_source_import_requires_user_confirmation_before_write(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "mpfeed.sqlite"
+            results_path = Path(temp_dir) / "llm-results.json"
+            store = Store(db_path)
+            store.init()
+            saved = store.save_search_candidates(
+                "示例量化",
+                [{"candidate_name": "示例量化", "wechat_fakeid": "fake_quant_source", "score": 0.95, "raw_payload": {}}],
+                {"items": []},
+            )
+            accepted = store.accept_candidate(saved["items"][0]["id"], tier="normal")
+
+            results_path.write_text(
+                json.dumps(
+                    {
+                        "results": [
+                            {
+                                "entity_type": "source",
+                                "entity_id": accepted["source_id"],
+                                "classification": {
+                                    "category": "quant",
+                                    "tags": ["sell_side"],
+                                    "confidence": 0.93,
+                                    "method": "llm:test",
+                                },
+                                "source_update": {"status": "active", "tier": "core"},
+                                "requires_user_confirmation": True,
+                                "taxonomy_suggestions": [
+                                    {
+                                        "type": "tag",
+                                        "suggested_id": "style_rotation",
+                                        "name_zh": "风格轮动",
+                                        "reason": "示例建议",
+                                    }
+                                ],
+                                "reason": "首次分类需要用户确认。",
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            with redirect_stdout(StringIO()) as stdout:
+                exit_code = main(["--db", str(db_path), "llm", "import-results", str(results_path)])
+            imported = json.loads(stdout.getvalue())
+            refreshed = Store(db_path)
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(imported["classifications_saved"], 0)
+            self.assertEqual(imported["source_updates"], 0)
+            self.assertEqual(imported["source_classification_reviews_saved"], 1)
+            self.assertEqual(refreshed.list_classifications(), [])
+            reviews = refreshed.list_source_classification_reviews()
+            self.assertEqual(reviews[0]["category"], "quant")
+            self.assertEqual(reviews[0]["taxonomy_suggestions"][0]["suggested_id"], "style_rotation")
+            self.assertEqual(refreshed.list_sources()[0]["tier"], "normal")
+
+    def test_llm_source_jobs_can_filter_one_source(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "mpfeed.sqlite"
+            store = Store(db_path)
+            store.init()
+            first = store.upsert_source(name="示例量化", wechat_fakeid="fake_quant", status="active", tier="normal")
+            second = store.upsert_source(name="示例宏观", wechat_fakeid="fake_macro", status="active", tier="normal")
+            store.upsert_articles(
+                first["source_id"],
+                [{"title": "行业轮动周报", "url": "https://mp.weixin.qq.com/s/quant", "digest": "量化策略", "raw_payload": {}}],
+            )
+            store.upsert_articles(
+                second["source_id"],
+                [{"title": "宏观周报", "url": "https://mp.weixin.qq.com/s/macro", "digest": "宏观策略", "raw_payload": {}}],
+            )
+
+            payload = build_llm_jobs(
+                store=store,
+                taxonomy=load_taxonomy(FINANCE_TAXONOMY),
+                entity_type="source",
+                source_id=first["source_id"],
+                source_article_limit=8,
+            )
+
+            self.assertEqual(payload["count"], 1)
+            self.assertEqual(payload["jobs"][0]["entity_id"], first["source_id"])
+            self.assertEqual(payload["jobs"][0]["source"]["name"], "示例量化")
+            self.assertEqual(payload["jobs"][0]["source"]["latest_articles"][0]["title"], "行业轮动周报")
 
     def test_cli_llm_onboarding_jobs_accept_source(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2033,7 +2939,7 @@ class MVPTest(unittest.TestCase):
                                 "requires_user_confirmation": False,
                                 "classification": {
                                     "category": "strategy",
-                                    "tags": ["equity"],
+                                    "tags": ["a_share"],
                                     "confidence": 0.86,
                                     "method": "llm:test",
                                 },

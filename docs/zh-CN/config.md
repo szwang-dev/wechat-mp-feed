@@ -226,7 +226,7 @@ PYTHONPATH=packages/wechat_mp_feed/src python3 -m wechat_mp_feed.cli \
 
 ### 图片归档
 
-正文阶段（content stage）LLM 评分完成后，可以运行 `mpfeed archive assets`。该命令只缓存 `full_archive` 文章的图片，通过 `article_assets.block_index` 和 `content_ref` 保留图片在正文中的位置。这样普通文章只保留元数据或正文结构，高价值文章才保存本地图片文件。
+正文阶段（content stage）LLM 评分完成后，可以运行 `mpfeed archive assets`。该命令只处理 `full_archive` 文章的图片，并默认启用保存前过滤。二维码、小图标、分隔线、小 logo、低复杂度装饰图、推广图和模板图会标记为 `download_status=skipped`，跳过原因写入 `article_assets.metadata.archive_decision`，本地不保存文件。保留下来的图片通过 `article_assets.block_index` 和 `content_ref` 保留正文顺序。只有明确需要保存全部图片时才使用 `--no-filter`。
 
 ## 输出
 

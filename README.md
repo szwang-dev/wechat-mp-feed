@@ -4,7 +4,7 @@
 
 **Agent-first WeChat Official Account feed infrastructure, with a built-in finance research layer.**
 
-[中文文档](docs/zh-CN/README.md) · [Agent Skill](skills/wechat-mp-feed/SKILL.md) · [CLI](docs/cli.md) · [Finance Taxonomy](docs/finance-taxonomy.md)
+[中文说明](README.zh-CN.md) · [Agent Skill](skills/wechat-mp-feed/SKILL.md) · [CLI](docs/cli.md) · [Finance Taxonomy](docs/finance-taxonomy.md)
 
 [![CI](https://github.com/szwang-dev/wechat-mp-feed/actions/workflows/ci.yml/badge.svg)](https://github.com/szwang-dev/wechat-mp-feed/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
@@ -38,7 +38,7 @@ The project has three layers:
 4. Backfill recent article metadata after onboarding.
 5. Refresh article metadata incrementally for reviewed sources.
 6. Run metadata-stage and content-stage LLM analysis through JSON jobs.
-7. Fetch retained article content and cache assets for high-value articles.
+7. Fetch retained article content and cache valuable assets for high-value articles.
 8. Export feed status, digest packs, and digest context for downstream applications.
 
 ## Outputs
@@ -46,7 +46,7 @@ The project has three layers:
 `wechat-mp-feed` produces four groups of artifacts:
 
 - Source registry: confirmed accounts, status, tiers, identity fields, and classifications.
-- Article store: article metadata, fetched text, HTML, structured content, image links, and image order.
+- Article store: article metadata, fetched text, HTML, structured content, image links, image order, and filtered local image assets.
 - Run reports: feed summaries, failure tables, retry context, and downloader health signals.
 - Agent context: LLM jobs, digest packs, and digest context for downstream applications.
 
@@ -95,6 +95,8 @@ work/demo-feed/feed-summary.json
 work/demo-feed/feed-failures.csv
 ```
 
+For scheduled or agent-supervised refreshes, use `mpfeed run daily`. It writes manifest and progress files, exports staged LLM jobs, fetches retained content, and produces digest packs for downstream applications. See [CLI Reference](docs/cli.md).
+
 For the WeChat article download service, source onboarding, and feed configuration, use the documentation links below.
 
 ## Documentation
@@ -108,7 +110,7 @@ For the WeChat article download service, source onboarding, and feed configurati
 | Storage Schema | [docs/schema.md](docs/schema.md) |
 | Agent Skill | [docs/agent-skills.md](docs/agent-skills.md) |
 | Finance Taxonomy | [docs/finance-taxonomy.md](docs/finance-taxonomy.md) |
-| Chinese Documentation | [docs/zh-CN/README.md](docs/zh-CN/README.md) |
+| Chinese Documentation | [README.zh-CN.md](README.zh-CN.md) |
 
 ## Data And Privacy
 

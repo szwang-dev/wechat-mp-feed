@@ -103,8 +103,8 @@
 | `block_index` | integer nullable | 在 `content_structure` 中的位置 |
 | `content_ref` | text nullable | 稳定引用，例如 `block:12` |
 | `local_path` | text nullable | 本地缓存路径 |
-| `metadata` | json nullable | 尺寸、封面、平台等元数据 |
-| `download_status` | text | `url_only`、`cached`、`failed`、`unsupported` |
+| `metadata` | json nullable | 尺寸、封面、平台、归档决策、启用 OCR 时的图片文字等元数据 |
+| `download_status` | text | `url_only`、`cached`、`skipped`、`failed`、`unsupported` |
 
 ### `classifications`
 

@@ -1,5 +1,6 @@
 import json
 import csv
+import struct
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -8,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from wechat_mp_feed.analysis import classify_article, classify_source, generate_article_digest
+from wechat_mp_feed.assets import classify_asset_for_archive
 from wechat_mp_feed.adapters.wechat_download_api import WeChatDownloadAPIAdapter, WeChatDownloadAPIConfig
 from wechat_mp_feed.articles import normalize_article_items
 from wechat_mp_feed.candidates import normalize_source_candidates
@@ -35,6 +37,10 @@ from wechat_mp_feed.llm_jobs import build_llm_jobs, build_onboarding_llm_jobs
 
 ROOT = Path(__file__).resolve().parents[3]
 FINANCE_TAXONOMY = ROOT / "examples" / "taxonomy.finance.yaml"
+
+
+def png_bytes(width: int, height: int, *, payload_size: int = 4096) -> bytes:
+    return b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + struct.pack(">II", width, height) + (b"x" * payload_size)
 
 
 class MVPTest(unittest.TestCase):
@@ -1355,6 +1361,61 @@ class MVPTest(unittest.TestCase):
             self.assertEqual(len(articles), 2)
             self.assertEqual(articles[0]["title"], "新增文章")
 
+    def test_cli_run_feed_aborts_after_consecutive_refresh_failures(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "mpfeed.sqlite"
+            work_dir = Path(temp_dir) / "feed-work"
+            store = Store(db_path)
+            store.init()
+            for index in range(3):
+                saved = store.save_search_candidates(
+                    f"示例失败账号{index}",
+                    [
+                        {
+                            "candidate_name": f"示例失败账号{index}",
+                            "wechat_fakeid": f"fake_failed_{index}",
+                            "score": 0.92,
+                            "raw_payload": {},
+                        }
+                    ],
+                    {"items": []},
+                )
+                store.accept_candidate(saved["items"][0]["id"], tier="core")
+
+            def fake_failing_articles_urlopen(request, timeout):
+                url = request.full_url
+                if url.endswith("/api/health"):
+                    return _FakeResponse({"status": "ok"})
+                if url.endswith("/api/admin/status"):
+                    return _FakeResponse({"logged_in": True})
+                if "/api/public/articles?" in url:
+                    return _FakeResponse({"success": False, "error": "temporary downloader failure"})
+                raise AssertionError(f"unexpected URL: {url}")
+
+            with patch("wechat_mp_feed.adapters.http.urlopen", side_effect=fake_failing_articles_urlopen), redirect_stdout(StringIO()):
+                exit_code = main(
+                    [
+                        "--db",
+                        str(db_path),
+                        "run",
+                        "feed",
+                        "--base-url",
+                        "http://example.test",
+                        "--work-dir",
+                        str(work_dir),
+                        "--max-consecutive-refresh-failures",
+                        "2",
+                        "--no-delay",
+                    ]
+                )
+
+            aborted = json.loads((work_dir / "article-refresh-aborted.json").read_text(encoding="utf-8"))
+            self.assertEqual(exit_code, 2)
+            self.assertEqual(aborted["status"], "aborted")
+            self.assertEqual(aborted["abort_reason"], "consecutive_refresh_failures")
+            self.assertEqual(aborted["sources_processed"], 2)
+            self.assertEqual(len(aborted["results"]), 2)
+
     def test_cli_run_feed_reads_config_and_exports_failures(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "mpfeed.sqlite"
@@ -1594,7 +1655,7 @@ class MVPTest(unittest.TestCase):
                     return None
 
                 def read(self):
-                    return b"png-bytes"
+                    return png_bytes(640, 480)
 
             with patch("wechat_mp_feed.assets.urlopen", return_value=_AssetResponse()), redirect_stdout(StringIO()) as stdout:
                 exit_code = main(
@@ -1614,9 +1675,128 @@ class MVPTest(unittest.TestCase):
 
             self.assertEqual(exit_code, 0)
             self.assertEqual(payload["assets_cached"], 1)
+            self.assertEqual(payload["assets_skipped"], 0)
             self.assertEqual(assets[0]["download_status"], "cached")
             self.assertTrue(Path(assets[0]["local_path"]).exists())
             self.assertEqual(articles[0]["archive_status"], "cached")
+
+    def test_cli_archive_assets_skips_low_value_images_before_saving(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "mpfeed.sqlite"
+            archive_dir = Path(temp_dir) / "asset-cache"
+            store = Store(db_path)
+            store.init()
+            source = store.upsert_source(
+                name="Archive Test",
+                wechat_fakeid="fake_archive_skip",
+                status="active",
+                tier="core",
+                source_type="test",
+            )
+            article = store.upsert_articles(
+                source["source_id"],
+                [
+                    {
+                        "title": "深度研究",
+                        "url": "https://mp.weixin.qq.com/s?__biz=MzA123&mid=92",
+                        "raw_payload": {},
+                    }
+                ],
+            )["items"][0]
+            store.upsert_article_content(
+                article["id"],
+                {
+                    "content_html": '<p>正文</p><img data-src="https://example.test/divider.png"/>',
+                    "content_text": "正文",
+                    "content_structure": [
+                        {"type": "text", "text": "正文"},
+                        {"type": "image", "url": "https://example.test/divider.png"},
+                    ],
+                    "assets": [{"asset_type": "image", "url": "https://example.test/divider.png", "metadata": {}}],
+                },
+            )
+            store.save_digest(
+                {
+                    "article_id": article["id"],
+                    "summary": "重要深度研究",
+                    "key_points": ["图表"],
+                    "importance_score": 0.9,
+                    "reason": "archive",
+                    "model": "llm:test",
+                    "analysis_stage": "content",
+                }
+            )
+
+            class _AssetResponse:
+                headers = {"Content-Type": "image/png"}
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    return None
+
+                def read(self):
+                    return png_bytes(600, 20)
+
+            with patch("wechat_mp_feed.assets.urlopen", return_value=_AssetResponse()), redirect_stdout(StringIO()) as stdout:
+                exit_code = main(
+                    [
+                        "--db",
+                        str(db_path),
+                        "archive",
+                        "assets",
+                        "--output-dir",
+                        str(archive_dir),
+                    ]
+                )
+            payload = json.loads(stdout.getvalue())
+            refreshed = Store(db_path)
+            assets = refreshed.list_article_assets(article["id"])
+            articles = refreshed.list_articles()
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(payload["assets_cached"], 0)
+            self.assertEqual(payload["assets_skipped"], 1)
+            self.assertEqual(assets[0]["download_status"], "skipped")
+            self.assertIsNone(assets[0]["local_path"])
+            self.assertEqual(assets[0]["metadata"]["archive_decision"]["reason"], "small_icon_or_logo")
+            self.assertFalse(any(archive_dir.rglob("*.*")))
+            self.assertEqual(articles[0]["archive_status"], "cached")
+
+    def test_asset_filter_skips_disclaimer_even_with_research_keywords(self):
+        decision = classify_asset_for_archive(
+            asset={"block_index": 20},
+            metadata={
+                "content_type": "image/png",
+                "bytes": 240000,
+                "width": 1080,
+                "height": 843,
+                "ocr_text": "免责声明 风险提示 本报告仅供参考 行业 指数 配置 收益率",
+            },
+        )
+
+        self.assertEqual(decision["action"], "skip")
+        self.assertEqual(decision["reason"], "ocr_low_value_or_promotion")
+
+    def test_asset_filter_skips_blank_decorative_background(self):
+        decision = classify_asset_for_archive(
+            asset={"block_index": 20},
+            metadata={
+                "content_type": "image/gif",
+                "bytes": 2_000_000,
+                "width": 900,
+                "height": 236,
+                "visual_stats": {
+                    "edge_density": 0.0,
+                    "non_white_ratio": 0.99,
+                    "quantized_unique_colors": 1,
+                },
+            },
+        )
+
+        self.assertEqual(decision["action"], "skip")
+        self.assertEqual(decision["reason"], "low_detail_decorative_image")
 
     def test_review_import_classified_sources_imports_reviewed_rows(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2734,6 +2914,61 @@ class MVPTest(unittest.TestCase):
         self.assertEqual(payload["outputs"]["metadata_jobs_count"], 1)
         self.assertEqual(jobs["jobs"][0]["analysis_stage"], "metadata")
         self.assertIn("--metadata-results", payload["next_steps"][0])
+
+    def test_run_daily_writes_manifest_and_waits_for_metadata_llm(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "mpfeed.sqlite"
+            output_dir = Path(temp_dir) / "daily" / "2026-05-25"
+            store = Store(db_path)
+            store.init()
+            saved = store.save_search_candidates(
+                "策略研究",
+                [{"candidate_name": "策略研究", "wechat_fakeid": "fake_daily", "score": 0.95, "raw_payload": {}}],
+                {"items": []},
+            )
+            accepted = store.accept_candidate(saved["items"][0]["id"], tier="core")
+            store.upsert_articles(
+                accepted["source_id"],
+                [
+                    {
+                        "title": "行业轮动周报",
+                        "url": "https://mp.weixin.qq.com/s/daily-runner",
+                        "digest": "行业轮动观点。",
+                        "publish_time": "2026-05-25T00:00:00+00:00",
+                        "raw_payload": {},
+                    }
+                ],
+            )
+
+            with redirect_stdout(StringIO()) as stdout:
+                exit_code = main(
+                    [
+                        "--db",
+                        str(db_path),
+                        "run",
+                        "daily",
+                        "--date",
+                        "2026-05-25",
+                        "--output-dir",
+                        str(output_dir),
+                        "--skip-refresh",
+                        "--no-delay",
+                    ]
+                )
+
+            payload = json.loads(stdout.getvalue())
+            manifest = json.loads((output_dir / "run-manifest.json").read_text(encoding="utf-8"))
+            jobs = json.loads((output_dir / "article-metadata-llm-jobs.json").read_text(encoding="utf-8"))
+            feed_exists = (output_dir / "feed-items.csv").exists()
+            progress_exists = (output_dir / "progress.ndjson").exists()
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(payload["status"], "WAITING_FOR_METADATA_LLM")
+            self.assertEqual(manifest["status"], "WAITING_FOR_METADATA_LLM")
+            self.assertEqual(manifest["metrics"]["metadata_llm_jobs"], 1)
+            self.assertEqual(jobs["jobs"][0]["analysis_stage"], "metadata")
+            self.assertTrue(feed_exists)
+            self.assertTrue(progress_exists)
 
     def test_llm_import_rejects_unknown_taxonomy_ids(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -226,7 +226,7 @@ PYTHONPATH=packages/wechat_mp_feed/src python3 -m wechat_mp_feed.cli \
 
 ### Asset Archive
 
-Use `mpfeed archive assets` after content-stage LLM scoring. It caches images only for `full_archive` articles, preserving image order through `article_assets.block_index` and `content_ref`. This keeps routine feed storage small while allowing high-value articles to be reconstructed with local image files.
+Use `mpfeed archive assets` after content-stage LLM scoring. It processes images only for `full_archive` articles and applies pre-save filtering by default. Low-value images such as QR codes, tiny icons, divider bars, small logos, low-detail decorative images, and promotional/template images are marked `download_status=skipped` with an `archive_decision` reason in `article_assets.metadata`; no local file is written for skipped images. Kept images preserve order through `article_assets.block_index` and `content_ref`. Use `--no-filter` only when an application explicitly needs every image file.
 
 ## Outputs
 

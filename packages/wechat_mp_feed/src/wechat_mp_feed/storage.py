@@ -1125,7 +1125,7 @@ class Store:
             "aa.url IS NOT NULL",
         ]
         if not cached:
-            where_parts.append("COALESCE(aa.download_status, 'url_only') != 'cached'")
+            where_parts.append("COALESCE(aa.download_status, 'url_only') NOT IN ('cached', 'skipped')")
         with self.connect() as conn:
             ensure_schema(conn)
             result = conn.execute(
@@ -1148,17 +1148,47 @@ class Store:
             )
             return [_decode_row(row, json_fields=("metadata",)) for row in result.fetchall()]
 
-    def update_article_asset_cache(self, asset_id: str, local_path: str | None, download_status: str) -> dict[str, Any]:
+    def update_article_asset_cache(
+        self,
+        asset_id: str,
+        local_path: str | None,
+        download_status: str,
+        metadata_patch: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         with self.connect() as conn:
             ensure_schema(conn)
-            conn.execute(
-                """
-                UPDATE article_assets
-                SET local_path = ?, download_status = ?
-                WHERE id = ?
-                """,
-                (local_path, download_status, asset_id),
-            )
+            metadata_text = None
+            if metadata_patch:
+                row = conn.execute("SELECT metadata FROM article_assets WHERE id = ?", (asset_id,)).fetchone()
+                metadata: dict[str, Any] = {}
+                if row and row["metadata"]:
+                    try:
+                        parsed = json.loads(row["metadata"])
+                        if isinstance(parsed, dict):
+                            metadata = parsed
+                    except json.JSONDecodeError:
+                        metadata = {}
+                metadata.update(metadata_patch)
+                metadata_text = json.dumps(metadata, ensure_ascii=False, sort_keys=True)
+
+            if metadata_text is not None:
+                conn.execute(
+                    """
+                    UPDATE article_assets
+                    SET local_path = ?, download_status = ?, metadata = ?
+                    WHERE id = ?
+                    """,
+                    (local_path, download_status, metadata_text, asset_id),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE article_assets
+                    SET local_path = ?, download_status = ?
+                    WHERE id = ?
+                    """,
+                    (local_path, download_status, asset_id),
+                )
         return {"ok": True, "asset_id": asset_id, "local_path": local_path, "download_status": download_status}
 
     def refresh_article_archive_status(self, article_id: str) -> dict[str, Any]:
@@ -1170,6 +1200,7 @@ class Store:
                 SELECT
                   count(*) AS total_assets,
                   sum(CASE WHEN download_status = 'cached' THEN 1 ELSE 0 END) AS cached_assets,
+                  sum(CASE WHEN download_status = 'skipped' THEN 1 ELSE 0 END) AS skipped_assets,
                   sum(CASE WHEN download_status = 'failed' THEN 1 ELSE 0 END) AS failed_assets
                 FROM article_assets
                 WHERE article_id = ? AND asset_type = 'image'
@@ -1178,8 +1209,9 @@ class Store:
             ).fetchone()
             total = int(row["total_assets"] or 0)
             cached = int(row["cached_assets"] or 0)
+            skipped = int(row["skipped_assets"] or 0)
             failed = int(row["failed_assets"] or 0)
-            if total and cached == total:
+            if total and cached + skipped == total:
                 archive_status = "cached"
             elif failed:
                 archive_status = "failed"

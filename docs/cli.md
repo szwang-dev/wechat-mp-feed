@@ -358,6 +358,64 @@ Important behavior:
 - body-level retry hints such as `请 N 秒后重试` are honored.
 - failed rows keep `fetch_error` so users can distinguish retryable limits from deleted or restricted articles.
 
+## `run daily`
+
+Run the stable daily feed runner for scheduled jobs and agent supervision.
+
+```bash
+mpfeed --db ./work/feed.sqlite run daily \
+  --date 2026-05-25 \
+  --base-url http://127.0.0.1:5001 \
+  --work-dir ./work/daily-feed
+```
+
+The command writes a dated run directory:
+
+```text
+work/daily-feed/YYYY-MM-DD/
+  run-manifest.json
+  run-manifest-latest.json
+  progress.ndjson
+  feed-items.csv
+  feed-summary.json
+  feed-failures.csv
+  article-metadata-llm-jobs.json
+  article-llm-jobs.json
+  digest-packs/
+```
+
+Status values are explicit:
+
+- `RUNNING`: code is still working and progress should be checked before reporting failure.
+- `WAITING_FOR_METADATA_LLM`: metadata refresh and metadata jobs are complete; an agent should fill `article-metadata-llm-jobs.json` and rerun with `--metadata-results`.
+- `WAITING_FOR_CONTENT_LLM`: retained content has been fetched and content jobs are complete; an agent should fill `article-llm-jobs.json` and rerun with `--content-results`.
+- `DONE`: digest packs and final context exports are complete.
+- `LOGIN_REQUIRED`, `DOWNLOADER_UNREACHABLE`, `REFRESH_CIRCUIT_BREAKER`, `FAILED`: actionable failure states for agents or schedulers.
+
+Resume pattern:
+
+```bash
+mpfeed --db ./work/feed.sqlite run daily \
+  --date 2026-05-25 \
+  --base-url http://127.0.0.1:5001 \
+  --skip-refresh \
+  --metadata-results ./work/daily-feed/2026-05-25/article-metadata-llm-results.json
+
+mpfeed --db ./work/feed.sqlite run daily \
+  --date 2026-05-25 \
+  --base-url http://127.0.0.1:5001 \
+  --skip-refresh \
+  --metadata-results ./work/daily-feed/2026-05-25/article-metadata-llm-results.json \
+  --content-results ./work/daily-feed/2026-05-25/article-llm-results.json
+```
+
+Operational notes:
+
+- The runner belongs to `wechat-mp-feed`, not to the downloader service. The downloader remains a replaceable HTTP adapter.
+- Local, Docker, and agent usage all call the same CLI. Docker should mount a persistent `work/` directory.
+- Asset OCR is off by default. Expensive image OCR should run as a separate review task, not in the daily critical path.
+- Agents should read `run-manifest.json` and `progress.ndjson`; they should not treat an advancing `RUNNING` manifest as a failed run.
+
 ## `run agent-smoke`
 
 Run offline agent validation with synthetic feed data:
@@ -444,10 +502,14 @@ mpfeed archive assets --output-dir work/archive/assets --limit 100
 Behavior:
 
 - selects image assets from articles whose `retention_level=full_archive`
-- downloads images to a local directory grouped by article id
+- downloads kept images to a local directory grouped by article id
+- filters low-value images before writing files, including QR codes, tiny icons, divider bars, small logos, low-detail decorative images, and promotional/template images
 - updates `article_assets.local_path` and `download_status`
+- marks filtered images as `download_status=skipped` and stores the reason in `article_assets.metadata.archive_decision`
 - updates `articles.archive_status` to `cached`, `pending`, or `failed`
 - preserves image order through `article_assets.block_index` and `content_ref`
+
+Filtering is enabled by default. Use `--no-filter` to cache every image, or `--asset-filter-ocr paddle` to add optional OCR text signals when OCR extras are installed.
 
 ## `llm`
 
@@ -591,7 +653,7 @@ External push is explicit.
 
 ```bash
 mpfeed deliver webhook --since 24h --target https://...
-mpfeed deliver discord --since 24h --channel workflow-report
+mpfeed deliver discord --since 24h --channel <channel-name>
 ```
 
 For agent systems, use the skill wrapper to call package commands and use the agent platform's message/file tools for channel delivery.

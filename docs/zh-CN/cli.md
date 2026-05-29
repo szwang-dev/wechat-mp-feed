@@ -122,7 +122,7 @@ mpfeed export onboarding --source-type recording --view compact --taxonomy finan
 mpfeed archive assets --output-dir work/archive/assets --limit 100
 ```
 
-该命令只处理 `retention_level=full_archive` 的文章图片，下载后更新 `article_assets.local_path` 和 `download_status`，并根据缓存结果更新 `articles.archive_status`。图片在原文中的顺序通过 `block_index` / `content_ref` 保留。
+该命令只处理 `retention_level=full_archive` 的文章图片，默认在写入本地文件前过滤二维码、小图标、分隔线、小 logo、低复杂度装饰图、推广图和模板图。保留图片会更新 `article_assets.local_path` 和 `download_status=cached`；过滤图片会写入 `download_status=skipped`，跳过原因保存在 `article_assets.metadata.archive_decision`。图片在原文中的顺序通过 `block_index` / `content_ref` 保留。需要保存全部图片时使用 `--no-filter`；已安装 OCR extras 时，可以用 `--asset-filter-ocr paddle` 增加图片文字识别信号。
 
 ## `llm`
 
@@ -292,6 +292,64 @@ feed-failures.csv/json
 - `--refresh-mode incremental`：从最新页开始向后翻，直到遇到数据库里该公众号的最新已知文章，或达到 `--incremental-max-pages` 安全上限。
 
 `--count` 是 downloader 的分页大小。对微信公众号来说，它可能对应最近发布批次；一个发布批次可以包含多篇文章，入库时会展开成多条文章元数据。
+
+## `run daily`
+
+稳定日更 runner，面向定时任务和 agent 监督。
+
+```bash
+mpfeed --db ./work/feed.sqlite run daily \
+  --date 2026-05-25 \
+  --base-url http://127.0.0.1:5001 \
+  --work-dir ./work/daily-feed
+```
+
+命令会写入日期目录：
+
+```text
+work/daily-feed/YYYY-MM-DD/
+  run-manifest.json
+  run-manifest-latest.json
+  progress.ndjson
+  feed-items.csv
+  feed-summary.json
+  feed-failures.csv
+  article-metadata-llm-jobs.json
+  article-llm-jobs.json
+  digest-packs/
+```
+
+状态含义：
+
+- `RUNNING`：代码仍在执行，agent 应继续观察 `progress.ndjson`，不要直接判定失败。
+- `WAITING_FOR_METADATA_LLM`：文章元数据刷新完成，已导出元数据阶段 LLM 任务；agent 完成 `article-metadata-llm-jobs.json` 后，用 `--metadata-results` 继续。
+- `WAITING_FOR_CONTENT_LLM`：正文抓取完成，已导出正文阶段 LLM 任务；agent 完成 `article-llm-jobs.json` 后，用 `--content-results` 继续。
+- `DONE`：摘要包和上下文导出完成。
+- `LOGIN_REQUIRED`、`DOWNLOADER_UNREACHABLE`、`REFRESH_CIRCUIT_BREAKER`、`FAILED`：需要 agent 或调度层处理的失败状态。
+
+恢复示例：
+
+```bash
+mpfeed --db ./work/feed.sqlite run daily \
+  --date 2026-05-25 \
+  --base-url http://127.0.0.1:5001 \
+  --skip-refresh \
+  --metadata-results ./work/daily-feed/2026-05-25/article-metadata-llm-results.json
+
+mpfeed --db ./work/feed.sqlite run daily \
+  --date 2026-05-25 \
+  --base-url http://127.0.0.1:5001 \
+  --skip-refresh \
+  --metadata-results ./work/daily-feed/2026-05-25/article-metadata-llm-results.json \
+  --content-results ./work/daily-feed/2026-05-25/article-llm-results.json
+```
+
+运行约定：
+
+- runner 属于 `wechat-mp-feed`，不放进 downloader。downloader 只作为可替换 HTTP adapter。
+- 本地、Docker 和 agent 调用同一条 CLI；Docker 场景需要挂载持久化 `work/` 目录。
+- 图片 OCR 默认关闭。高成本图片复核应作为独立任务，不进入每日 feed 主链路。
+- agent 应读取 `run-manifest.json` 和 `progress.ndjson`；只要 `RUNNING` 仍有进展，就不应输出失败。
 
 ## `run agent-smoke`
 

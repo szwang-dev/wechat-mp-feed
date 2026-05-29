@@ -4,19 +4,19 @@
 
 **面向 Agent 的微信公众号 feed 基础设施，内置金融投研增强层。**
 
-[English](../../README.md) · [Agent Skill](../../skills/wechat-mp-feed/SKILL.md) · [CLI](cli.md) · [金融分类体系](finance-taxonomy.md)
+[English](README.md) · [Agent Skill](skills/wechat-mp-feed/SKILL.md) · [CLI](docs/zh-CN/cli.md) · [金融分类体系](docs/zh-CN/finance-taxonomy.md)
 
 [![CI](https://github.com/szwang-dev/wechat-mp-feed/actions/workflows/ci.yml/badge.svg)](https://github.com/szwang-dev/wechat-mp-feed/actions/workflows/ci.yml)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](../../LICENSE)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue.svg)](https://www.python.org/)
-[![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)](../../.github/workflows/ci.yml)
-[![Agent Skill](https://img.shields.io/badge/agent--skill-SKILL.md-6f42c1.svg)](../../skills/wechat-mp-feed/SKILL.md)
+[![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)](.github/workflows/ci.yml)
+[![Agent Skill](https://img.shields.io/badge/agent--skill-SKILL.md-6f42c1.svg)](skills/wechat-mp-feed/SKILL.md)
 
 </div>
 
 `wechat-mp-feed` 用于把微信公众号内容转成本地 feed，支持审核、更新、检索和 agent 调用。核心 feed 层负责来源接入、文章更新、正文提取和本地存储；项目内置金融投研语义层，包含账号分类、文章分类、标签、评分规则和应用目标，并可按实际研究目标调整或替换。
 
-项目在本地 SQLite 中保存来源身份、文章元数据、正文、图片位置、分类和摘要（digest）。公众号搜索和文章抓取由用户自行运行的微信文章下载服务处理，例如 Docker 容器或本机进程。服务地址和配置流程见 [Feed 配置](config.md)。
+项目在本地 SQLite 中保存来源身份、文章元数据、正文、图片位置、分类和摘要（digest）。公众号搜索和文章抓取由用户自行运行的微信文章下载服务处理，例如 Docker 容器或本机进程。服务地址和配置流程见 [Feed 配置](docs/zh-CN/config.md)。
 
 ## 项目概览
 
@@ -28,7 +28,7 @@
 - 语义配置层：通过分类体系（taxonomy）、标签、评分规则和 LLM 任务（LLM jobs）解释来源和文章价值。
 - 应用输出层：导出摘要包（digest packs）、摘要上下文（digest context）和面向下游工作流的结构化结果。
 
-![三层结构](../assets/zh-cn/system-overview.svg)
+![三层结构](docs/assets/zh-cn/system-overview.svg)
 
 ## 核心流程
 
@@ -38,7 +38,7 @@
 4. 首次接入后回补近期文章元数据。
 5. 对已审核来源执行增量文章刷新。
 6. 通过 JSON 任务（JSON jobs）执行元数据阶段（metadata stage）和正文阶段（content stage）的 LLM 分析。
-7. 抓取保留文章正文，并为高价值文章缓存图片资产。
+7. 抓取保留文章正文，并为高价值文章缓存有信息价值的图片资产。
 8. 导出 feed 状态、摘要包（digest packs）和下游应用使用的摘要上下文（digest context）。
 
 ## 主要产出
@@ -46,11 +46,11 @@
 `wechat-mp-feed` 的产出分为四类：
 
 - 来源库：已确认的公众号账号、状态、层级、身份字段和分类结果。
-- 文章库：文章元数据、正文、HTML、结构化正文、图片链接和图片顺序。
+- 文章库：文章元数据、正文、HTML、结构化正文、图片链接、图片顺序和过滤后的本地图片资产。
 - 运行报告：feed 汇总、失败列表、重试线索和下载服务状态。
 - Agent 上下文：LLM 任务（LLM jobs）、摘要包（digest packs）和摘要上下文（digest context）。
 
-表结构细节见 [存储 Schema](schema.md)。
+表结构细节见 [存储 Schema](docs/zh-CN/schema.md)。
 
 ## 领域包
 
@@ -58,7 +58,7 @@
 
 项目内置金融投研领域包，覆盖宏观、策略、固收、金工、行业研究、公司研究、市场基础设施、媒体和 KOL 等来源类型，并提供文章评分规则和 `daily_digest`、`weekly_report`、`strategy_backlog`、`market_view`、`industry_tracking`、`risk_monitoring` 等应用目标。
 
-详见 [金融分类体系](finance-taxonomy.md)。
+详见 [金融分类体系](docs/zh-CN/finance-taxonomy.md)。
 
 ## Agent 集成
 
@@ -70,7 +70,7 @@ skills/wechat-mp-feed/
 
 Agent 通过 `mpfeed` 执行首次接入、feed 刷新、失败检查、LLM 任务导出/导入、单账号接入、退订和重新启用。CLI 提供结构化输出和受控写入口，适合在 Codex、Claude Code 和其他 agent 系统中调用。
 
-详见 [Agent Skill](agent-skills.md) 和 [CLI 参考](cli.md)。
+详见 [Agent Skill](docs/zh-CN/agent-skills.md) 和 [CLI 参考](docs/zh-CN/cli.md)。
 
 ## 快速开始
 
@@ -95,20 +95,22 @@ work/demo-feed/feed-summary.json
 work/demo-feed/feed-failures.csv
 ```
 
+定时刷新或 agent 监督运行建议使用 `mpfeed run daily`。该命令会写入 manifest 和 progress 文件，导出分阶段 LLM 任务，抓取保留正文，并生成供下游应用使用的摘要包（digest packs）。详见 [CLI 参考](docs/zh-CN/cli.md)。
+
 微信文章下载服务、来源接入和 feed 配置请参考下方文档。
 
 ## 文档索引
 
 | 主题 | 链接 |
 |---|---|
-| 架构设计 | [architecture.md](architecture.md) |
-| CLI 参考 | [cli.md](cli.md) |
-| 下载服务 Adapter 契约 | [downloader-adapter.md](downloader-adapter.md) |
-| Feed 配置 | [config.md](config.md) |
-| 存储 Schema | [schema.md](schema.md) |
-| Agent Skill | [agent-skills.md](agent-skills.md) |
-| 金融分类体系 | [finance-taxonomy.md](finance-taxonomy.md) |
-| English Documentation | [../../README.md](../../README.md) |
+| 架构设计 | [docs/zh-CN/architecture.md](docs/zh-CN/architecture.md) |
+| CLI 参考 | [docs/zh-CN/cli.md](docs/zh-CN/cli.md) |
+| 下载服务 Adapter 契约 | [docs/zh-CN/downloader-adapter.md](docs/zh-CN/downloader-adapter.md) |
+| Feed 配置 | [docs/zh-CN/config.md](docs/zh-CN/config.md) |
+| 存储 Schema | [docs/zh-CN/schema.md](docs/zh-CN/schema.md) |
+| Agent Skill | [docs/zh-CN/agent-skills.md](docs/zh-CN/agent-skills.md) |
+| 金融分类体系 | [docs/zh-CN/finance-taxonomy.md](docs/zh-CN/finance-taxonomy.md) |
+| English Documentation | [README.md](README.md) |
 
 ## 数据与隐私
 

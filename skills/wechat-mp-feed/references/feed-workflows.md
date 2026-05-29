@@ -1,5 +1,14 @@
 # Feed Workflows
 
+## Contents
+
+- Offline Agent Validation
+- Real Feed Run
+- Daily Runner For Scheduled Jobs
+- Onboarding
+- Single Source Intake And Status
+- Article LLM Jobs
+
 ## Offline Agent Validation
 
 Run:
@@ -76,7 +85,47 @@ If the command reports downloader auth failure:
 
 1. Show the login URL if present.
 2. Ask the user to scan the QR code.
-3. Retry the same command after login.
+3. If the user reports a scan error, first regenerate the downloader QR and verify the QR type. Downloader login QR payloads should be WeChat scan-login URLs under `mp.weixin.qq.com/mp/scanlogin`. QR payloads containing `ws://` or `wss://` gateway URLs are agent-platform device-pairing codes, not downloader login codes.
+4. Do not change agent-platform pairing or network-exposure settings for a downloader WeChat login failure unless the QR payload is actually a device-pairing URL.
+5. Retry the same command after login.
+
+## Daily Runner For Scheduled Jobs
+
+For cron, system timers, Docker entrypoints, or agent-supervised daily refreshes, prefer:
+
+```bash
+mpfeed run daily \
+  --db ./work/feed.sqlite \
+  --base-url http://127.0.0.1:5001 \
+  --work-dir ./work/daily-feed
+```
+
+Expected dated outputs:
+
+```text
+work/daily-feed/YYYY-MM-DD/run-manifest.json
+work/daily-feed/YYYY-MM-DD/run-manifest-latest.json
+work/daily-feed/YYYY-MM-DD/progress.ndjson
+work/daily-feed/YYYY-MM-DD/feed-items.csv
+work/daily-feed/YYYY-MM-DD/feed-summary.json
+work/daily-feed/YYYY-MM-DD/feed-failures.csv
+work/daily-feed/YYYY-MM-DD/article-metadata-llm-jobs.json
+work/daily-feed/YYYY-MM-DD/article-llm-jobs.json
+work/daily-feed/YYYY-MM-DD/digest-packs/
+```
+
+Agent handling:
+
+- `RUNNING`: inspect `progress.ndjson`; if progress is advancing, wait instead of reporting failure.
+- `WAITING_FOR_METADATA_LLM`: complete `article-metadata-llm-jobs.json`, write results, then rerun with `--skip-refresh --metadata-results`.
+- `WAITING_FOR_CONTENT_LLM`: complete `article-llm-jobs.json`, write results, then rerun with `--skip-refresh --metadata-results --content-results`.
+- `DONE`: read `digest-packs/` or `export digest-context` for application output.
+- `LOGIN_REQUIRED`: send or show the downloader login URL/QR workflow, then rerun after login.
+- `DOWNLOADER_UNREACHABLE` and `REFRESH_CIRCUIT_BREAKER`: inspect downloader health and recent logs before retrying.
+
+The runner belongs to `wechat-mp-feed`, not the downloader. The downloader can remain a separate local process or container. In Docker deployments, mount a persistent `work/` directory and call the same CLI inside the runner environment.
+
+Asset OCR is off by default for the daily critical path. Use separate image-review jobs when OCR is needed.
 
 After content-stage LLM scoring, archive images only for high-value `full_archive` articles:
 
@@ -84,7 +133,7 @@ After content-stage LLM scoring, archive images only for high-value `full_archiv
 mpfeed archive assets --output-dir ./work/archive/assets
 ```
 
-This preserves image files locally and keeps their order through `article_assets.block_index` and `content_ref`.
+This preserves kept image files locally and keeps their order through `article_assets.block_index` and `content_ref`. The default asset filter skips low-value images before saving, such as QR codes, icons, divider bars, small logos, low-detail decorative images, and promotional/template images. Skipped rows remain in `article_assets` with `download_status=skipped` and an `archive_decision` reason in metadata. Use `--no-filter` only when the user explicitly needs every image file.
 
 ## Onboarding
 
@@ -174,6 +223,8 @@ mpfeed llm import-results ./work/article-llm-results.json --model llm:agent
 ```
 
 Agent results should include classification, digest, `score_breakdown`, reference holistic importance score, reason, and `analysis_stage`. Metadata-stage jobs use `article_metadata_score_rubric` and should favor recall for content fetching; do not return a free-form triage decision because the system computes fetch action from the formula score plus deterministic low-signal overrides. Content-stage jobs use `article_score_rubric` and should also return `digest.application_targets` so downstream workflows can route articles to daily digest, weekly report, strategy backlog, market view, industry tracking, risk monitoring, source-quality review, or ignore. Do not assign a free-form score without sub-scores. Imports store the formula score computed from `score_breakdown`; the holistic score is kept as `model_importance_score` for review. Low-signal articles such as recruiting, events, product marketing, and boilerplate market wrap text should stay below normal digest thresholds unless they contain reusable research logic.
+
+LLM jobs are designed for batch or chunked processing. Prefer batching when practical to avoid repeating taxonomy and scoring rubrics. Single-item processing is acceptable for retries, high-value article review, user-directed analysis, or context-size limits.
 
 Recommended staged workflow:
 

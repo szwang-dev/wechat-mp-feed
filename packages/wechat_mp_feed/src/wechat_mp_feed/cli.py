@@ -513,6 +513,17 @@ def build_parser() -> argparse.ArgumentParser:
     archive_assets.add_argument("--limit", type=int, default=100)
     archive_assets.add_argument("--timeout", type=float, default=30.0)
     archive_assets.add_argument("--overwrite", action="store_true")
+    archive_assets.add_argument(
+        "--no-filter",
+        action="store_true",
+        help="Cache every image asset without pre-save low-value filtering.",
+    )
+    archive_assets.add_argument(
+        "--asset-filter-ocr",
+        choices=("off", "paddle"),
+        default="off",
+        help="Optional OCR engine for asset filtering. Default: off.",
+    )
     archive_assets.set_defaults(func=cmd_archive_assets)
 
     llm_parser = subcommands.add_parser("llm", help="Export/import agent-agnostic LLM analysis jobs.")
@@ -718,6 +729,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=10,
         help="Emit refresh progress every N sources. Use 0 to disable periodic progress.",
     )
+    run_feed.add_argument(
+        "--max-consecutive-refresh-failures",
+        type=int,
+        default=0,
+        help=(
+            "Abort article metadata refresh after N consecutive source failures. "
+            "Use 0 to disable the circuit breaker."
+        ),
+    )
     run_feed.add_argument("--feed-limit", type=int, default=3000)
     run_feed.add_argument("--work-dir", default="work/feed")
     run_feed.add_argument("--feed-output", help="Output path for feed items. Defaults to <work-dir>/feed-items.<format>.")
@@ -746,8 +766,64 @@ def build_parser() -> argparse.ArgumentParser:
     run_feed.add_argument("--content-delay-max", type=float, default=6.0)
     run_feed.add_argument("--content-passes", type=int, default=3, help="Internal passes over the same retained-content queue.")
     run_feed.add_argument("--content-pass-cooldown-seconds", type=float, default=30.0, help="Cooldown between retained-content passes.")
+    run_feed.add_argument(
+        "--content-progress-every",
+        type=int,
+        help="Print retained-content fetch progress every N articles. Defaults to --progress-every.",
+    )
     run_feed.add_argument("--no-delay", action="store_true", help="Disable delays for local testing.")
     run_feed.set_defaults(func=cmd_run_feed)
+
+    run_daily = run_subcommands.add_parser(
+        "daily",
+        help="Run a resumable daily feed runner with manifest/progress files for agent supervision.",
+    )
+    run_daily.add_argument("--db", default=argparse.SUPPRESS, help="SQLite database path.")
+    run_daily.add_argument("--date", help="Run date, YYYY-MM-DD. Defaults to the local date.")
+    run_daily.add_argument("--work-dir", default="work/daily-feed", help="Parent directory for dated daily outputs.")
+    run_daily.add_argument("--output-dir", help="Exact output directory. Defaults to <work-dir>/<date>.")
+    run_daily.add_argument("--base-url", help="Service base URL. Defaults to WECHAT_DOWNLOAD_API_BASE_URL.")
+    run_daily.add_argument("--timeout", type=float, default=45, help="HTTP timeout in seconds.")
+    run_daily.add_argument("--taxonomy", default="finance")
+    run_daily.add_argument("--tier", choices=("all", "core", "normal", "long_tail"), default="all")
+    run_daily.add_argument("--max-sources", type=int, default=0, help="Maximum active sources to refresh. Use 0 for all active sources.")
+    run_daily.add_argument("--count", type=int, default=6, help="Downloader article-list page size.")
+    run_daily.add_argument("--begin", type=int, default=0)
+    run_daily.add_argument("--refresh-mode", choices=("latest", "incremental"), default="incremental")
+    run_daily.add_argument("--incremental-max-pages", type=int, default=4)
+    run_daily.add_argument("--incremental-page-delay-min", type=float, default=1.0)
+    run_daily.add_argument("--incremental-page-delay-max", type=float, default=2.0)
+    run_daily.add_argument("--retries", type=int, default=2)
+    run_daily.add_argument("--backoff-seconds", type=float, default=3.0)
+    run_daily.add_argument("--delay-min", type=float, default=1.0)
+    run_daily.add_argument("--delay-max", type=float, default=3.0)
+    run_daily.add_argument("--progress-every", type=int, default=10)
+    run_daily.add_argument("--max-consecutive-refresh-failures", type=int, default=8)
+    run_daily.add_argument("--feed-limit", type=int, default=3000)
+    run_daily.add_argument("--skip-refresh", action="store_true", help="Do not call downloader for article metadata.")
+    run_daily.add_argument("--score-limit", type=int, default=1000, help="Rules fallback scoring limit. Use 0 for all articles.")
+    run_daily.add_argument("--min-score", type=float, default=0.0)
+    run_daily.add_argument("--metadata-results", help="Optional metadata-stage LLM results to import.")
+    run_daily.add_argument("--content-results", help="Optional content-stage LLM results to import.")
+    run_daily.add_argument("--model", default="llm:agent")
+    run_daily.add_argument("--llm-limit", type=int, default=0, help="Maximum LLM jobs per stage. Use 0 for all matching articles.")
+    run_daily.add_argument("--content-chars", type=int, default=6000)
+    run_daily.add_argument("--content-limit", type=int, default=80, help="Retained article count to fetch after metadata results.")
+    run_daily.add_argument("--content-retention", choices=("content_or_archive", "content", "full_archive", "all"), default="content_or_archive")
+    run_daily.add_argument("--content-retries", type=int, default=2)
+    run_daily.add_argument("--content-backoff-seconds", type=float, default=5.0)
+    run_daily.add_argument("--content-delay-min", type=float, default=4.0)
+    run_daily.add_argument("--content-delay-max", type=float, default=8.0)
+    run_daily.add_argument("--content-passes", type=int, default=3)
+    run_daily.add_argument("--content-pass-cooldown-seconds", type=float, default=30.0)
+    run_daily.add_argument("--content-progress-every", type=int, default=1)
+    run_daily.add_argument("--asset-limit", type=int, default=80)
+    run_daily.add_argument("--asset-timeout", type=float, default=30.0)
+    run_daily.add_argument("--asset-filter-ocr", choices=("off", "paddle"), default="off")
+    run_daily.add_argument("--no-archive-assets", action="store_true", help="Skip full-archive image caching.")
+    run_daily.add_argument("--digest-min-score", type=float, default=0.6)
+    run_daily.add_argument("--no-delay", action="store_true", help="Disable delays for local testing.")
+    run_daily.set_defaults(func=cmd_run_daily)
 
     adapter_parser = subcommands.add_parser("adapter", help="Call configured downloader adapters.")
     adapter_subcommands = adapter_parser.add_subparsers(dest="adapter_command", required=True)
@@ -3369,6 +3445,8 @@ def cmd_archive_assets(args: argparse.Namespace) -> int:
         limit=effective_unbounded_limit(args.limit),
         timeout=args.timeout,
         overwrite=args.overwrite,
+        filter_assets=not args.no_filter,
+        ocr=args.asset_filter_ocr,
     )
     write_json(result)
     return 0 if result["ok"] else 1
@@ -3670,7 +3748,6 @@ def cmd_run_llm_feed(args: argparse.Namespace) -> int:
                 json.load(handle),
                 default_taxonomy=args.taxonomy,
                 default_model=args.model,
-                taxonomy=taxonomy,
             )
 
         if args.fetch_content:
@@ -3727,7 +3804,6 @@ def cmd_run_llm_feed(args: argparse.Namespace) -> int:
                 json.load(handle),
                 default_taxonomy=args.taxonomy,
                 default_model=args.model,
-                taxonomy=taxonomy,
             )
         for target in (
             "daily_digest",
@@ -3937,6 +4013,426 @@ def cmd_run_onboarding(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_run_daily(args: argparse.Namespace) -> int:
+    run_date = args.date or datetime.now().date().isoformat()
+    # Validate early so all output paths are deterministic.
+    datetime.strptime(run_date, "%Y-%m-%d")
+    output_dir = Path(args.output_dir).expanduser() if args.output_dir else Path(args.work_dir).expanduser() / run_date
+    output_dir.mkdir(parents=True, exist_ok=True)
+    progress_path = output_dir / "progress.ndjson"
+    manifest_path = output_dir / "run-manifest.json"
+    latest_manifest_path = output_dir / "run-manifest-latest.json"
+    outputs = daily_output_paths(output_dir)
+    store = get_store(args)
+    manifest = daily_manifest(
+        args=args,
+        run_date=run_date,
+        output_dir=output_dir,
+        progress_path=progress_path,
+        outputs=outputs,
+        status="RUNNING",
+    )
+    write_daily_manifest(manifest, manifest_path, latest_manifest_path)
+
+    def progress(stage: str, status: str, **payload: object) -> None:
+        daily_progress(progress_path, stage=stage, status=status, **payload)
+        manifest["stage"] = stage
+        manifest["status"] = status if status in DAILY_TERMINAL_STATUSES else "RUNNING"
+        if payload:
+            manifest.setdefault("events", []).append({"stage": stage, "status": status, **payload})
+            manifest["events"] = manifest["events"][-50:]
+        write_daily_manifest(manifest, manifest_path, latest_manifest_path)
+
+    try:
+        store.init()
+        progress("prepare", "RUNNING", db=str(store.db_path))
+
+        adapter = None
+        service = None
+        if not args.skip_refresh:
+            adapter = get_wechat_download_api(args)
+            base_url = args.base_url or adapter_base_url_from_env(required=True)
+            health = safe_adapter_call(adapter.health)
+            auth_status = safe_adapter_call(adapter.auth_status) if health.get("ok") else None
+            service = {"base_url": base_url, "health": health, "auth_status": auth_status}
+            manifest["service"] = service
+            if not health.get("ok"):
+                manifest["status"] = "DOWNLOADER_UNREACHABLE"
+                manifest["reason"] = "downloader health check failed"
+                manifest["finished_at"] = utc_now_iso()
+                write_daily_manifest(manifest, manifest_path, latest_manifest_path)
+                write_json(manifest)
+                return 2
+            if not (auth_status and auth_status_logged_in(auth_status)):
+                manifest["status"] = "LOGIN_REQUIRED"
+                manifest["reason"] = "downloader WeChat login is missing or expired"
+                manifest["login_url"] = login_url_for_base(base_url)
+                manifest["finished_at"] = utc_now_iso()
+                write_daily_manifest(manifest, manifest_path, latest_manifest_path)
+                write_json(manifest)
+                return 2
+
+        refreshed = None
+        if not args.skip_refresh:
+            assert adapter is not None
+            progress("refresh_metadata", "RUNNING")
+            refreshed = run_daily_refresh_metadata(store=store, adapter=adapter, args=args)
+            manifest["refreshed"] = refreshed
+            manifest["metrics"]["new_metadata_articles"] = refreshed.get("articles_saved")
+            if refreshed.get("status") == "aborted":
+                manifest["status"] = "REFRESH_CIRCUIT_BREAKER"
+                manifest["reason"] = refreshed.get("abort_reason")
+                manifest["finished_at"] = utc_now_iso()
+                write_daily_manifest(manifest, manifest_path, latest_manifest_path)
+                write_json(manifest)
+                return 2
+        else:
+            progress("refresh_metadata", "SKIPPED", reason="skip_refresh")
+
+        progress("score_rules", "RUNNING")
+        scored = classify_and_digest_articles(
+            store=store,
+            taxonomy=load_taxonomy(resolve_taxonomy_arg(args.taxonomy)),
+            limit=effective_unbounded_limit(args.score_limit),
+            min_score=args.min_score,
+        )
+        manifest["scored"] = {
+            "articles_seen": scored["articles_seen"],
+            "digests_saved": scored["digests_saved"],
+            "digests_skipped": scored["digests_skipped"],
+        }
+
+        write_daily_feed_exports(store=store, args=args, outputs=outputs)
+        summary = store.feed_summary()
+        manifest["summary"] = summary
+
+        llm_limit = effective_unbounded_limit(args.llm_limit)
+        taxonomy = load_taxonomy(resolve_taxonomy_arg(args.taxonomy))
+        progress("export_metadata_llm_jobs", "RUNNING")
+        metadata_jobs = build_llm_jobs(
+            store=store,
+            taxonomy=taxonomy,
+            entity_type="article",
+            limit=llm_limit,
+            article_content_scope="metadata",
+            article_analysis_stage="metadata",
+        )
+        write_json_file(outputs["metadata_jobs"], metadata_jobs)
+        manifest["metrics"]["metadata_llm_jobs"] = metadata_jobs["count"]
+        manifest["outputs"] = {key: str(value) for key, value in outputs.items()}
+
+        metadata_imported = None
+        if not args.metadata_results:
+            manifest["status"] = "WAITING_FOR_METADATA_LLM"
+            manifest["stage"] = "export_metadata_llm_jobs"
+            manifest["reason"] = "metadata-stage LLM results are required before content fetch"
+            manifest["next_steps"] = [
+                f"Ask an agent/LLM to complete {outputs['metadata_jobs']}.",
+                "Rerun mpfeed run daily with --skip-refresh --metadata-results <file>.",
+            ]
+            manifest["finished_at"] = utc_now_iso()
+            write_daily_manifest(manifest, manifest_path, latest_manifest_path)
+            write_json(manifest)
+            return 0
+
+        progress("import_metadata_llm_results", "RUNNING", file=args.metadata_results)
+        with open(args.metadata_results, encoding="utf-8") as handle:
+            metadata_imported = apply_llm_results(
+                store,
+                json.load(handle),
+                default_taxonomy=args.taxonomy,
+                default_model=args.model,
+            )
+        manifest["metadata_imported"] = metadata_imported
+
+        progress("fetch_content", "RUNNING")
+        if adapter is None:
+            adapter = get_wechat_download_api(args)
+        content_fetch = fetch_content_queue(
+            store=store,
+            adapter=adapter,
+            limit=effective_unbounded_limit(args.content_limit),
+            retention_levels=retention_levels_for_content_fetch(args.content_retention),
+            retries=args.content_retries,
+            backoff_seconds=args.content_backoff_seconds,
+            delay_min=args.content_delay_min,
+            delay_max=args.content_delay_max,
+            passes=args.content_passes,
+            pass_cooldown_seconds=args.content_pass_cooldown_seconds,
+            progress_every=args.content_progress_every,
+            no_delay=args.no_delay,
+        )
+        manifest["content_fetch"] = content_fetch
+        manifest["metrics"]["content_extracted_articles"] = content_fetch.get("content_ok")
+        write_daily_feed_exports(store=store, args=args, outputs=outputs)
+        manifest["summary"] = store.feed_summary()
+
+        progress("export_content_llm_jobs", "RUNNING")
+        content_jobs = build_llm_jobs(
+            store=store,
+            taxonomy=taxonomy,
+            entity_type="article",
+            limit=llm_limit,
+            content_chars=args.content_chars,
+            article_content_scope="content",
+            article_retention_levels=("content", "full_archive"),
+            article_analysis_stage="content",
+        )
+        write_json_file(outputs["content_jobs"], content_jobs)
+        manifest["metrics"]["content_llm_jobs"] = content_jobs["count"]
+
+        if not args.content_results:
+            manifest["status"] = "WAITING_FOR_CONTENT_LLM"
+            manifest["stage"] = "export_content_llm_jobs"
+            manifest["reason"] = "content-stage LLM results are required before final digest packs"
+            manifest["next_steps"] = [
+                f"Ask an agent/LLM to complete {outputs['content_jobs']}.",
+                "Rerun mpfeed run daily with --skip-refresh --metadata-results <file> --content-results <file>.",
+            ]
+            manifest["finished_at"] = utc_now_iso()
+            write_daily_manifest(manifest, manifest_path, latest_manifest_path)
+            write_json(manifest)
+            return 0
+
+        progress("import_content_llm_results", "RUNNING", file=args.content_results)
+        with open(args.content_results, encoding="utf-8") as handle:
+            content_imported = apply_llm_results(
+                store,
+                json.load(handle),
+                default_taxonomy=args.taxonomy,
+                default_model=args.model,
+            )
+        manifest["content_imported"] = content_imported
+
+        if not args.no_archive_assets:
+            progress("archive_assets", "RUNNING", ocr=args.asset_filter_ocr)
+            assets = cache_full_archive_assets(
+                store=store,
+                output_dir=outputs["assets_dir"],
+                limit=effective_unbounded_limit(args.asset_limit),
+                timeout=args.asset_timeout,
+                overwrite=False,
+                filter_assets=True,
+                ocr=args.asset_filter_ocr,
+            )
+            manifest["assets"] = assets
+            manifest["metrics"]["image_assets_cached"] = assets.get("assets_cached")
+            manifest["metrics"]["image_assets_skipped"] = assets.get("assets_skipped")
+            write_daily_feed_exports(store=store, args=args, outputs=outputs)
+            manifest["summary"] = store.feed_summary()
+        else:
+            progress("archive_assets", "SKIPPED", reason="no_archive_assets")
+
+        progress("export_digest_packs", "RUNNING")
+        digest_packs = write_daily_digest_packs(
+            store=store,
+            output_dir=outputs["digest_packs_dir"],
+            limit=llm_limit,
+            min_score=args.digest_min_score,
+        )
+        manifest["digest_packs"] = digest_packs
+        manifest["status"] = "DONE"
+        manifest["stage"] = "done"
+        manifest["finished_at"] = utc_now_iso()
+        write_daily_manifest(manifest, manifest_path, latest_manifest_path)
+        write_json(manifest)
+        return 0
+    except Exception as exc:
+        manifest["status"] = "FAILED"
+        manifest["reason"] = str(exc)
+        manifest["finished_at"] = utc_now_iso()
+        write_daily_manifest(manifest, manifest_path, latest_manifest_path)
+        raise
+
+
+DAILY_TERMINAL_STATUSES = {
+    "DONE",
+    "WAITING_FOR_METADATA_LLM",
+    "WAITING_FOR_CONTENT_LLM",
+    "LOGIN_REQUIRED",
+    "DOWNLOADER_UNREACHABLE",
+    "REFRESH_CIRCUIT_BREAKER",
+    "FAILED",
+}
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def daily_output_paths(output_dir: Path) -> dict[str, Path]:
+    digest_packs_dir = output_dir / "digest-packs"
+    return {
+        "feed": output_dir / "feed-items.csv",
+        "summary": output_dir / "feed-summary.json",
+        "failures": output_dir / "feed-failures.csv",
+        "metadata_jobs": output_dir / "article-metadata-llm-jobs.json",
+        "content_jobs": output_dir / "article-llm-jobs.json",
+        "assets_dir": output_dir / "assets",
+        "digest_packs_dir": digest_packs_dir,
+        "daily_digest_pack": digest_packs_dir / "daily_digest.md",
+        "daily_digest_context": digest_packs_dir / "daily_digest.context.json",
+    }
+
+
+def daily_manifest(
+    *,
+    args: argparse.Namespace,
+    run_date: str,
+    output_dir: Path,
+    progress_path: Path,
+    outputs: dict[str, Path],
+    status: str,
+) -> dict[str, object]:
+    return {
+        "schema_version": "mpfeed_daily_manifest_v1",
+        "status": status,
+        "stage": "prepare",
+        "date": run_date,
+        "started_at": utc_now_iso(),
+        "finished_at": None,
+        "db": str(resolve_db_path(args.db)),
+        "work_dir": str(output_dir),
+        "progress": str(progress_path),
+        "service": None,
+        "metrics": {
+            "new_metadata_articles": None,
+            "metadata_llm_jobs": None,
+            "content_extracted_articles": None,
+            "content_llm_jobs": None,
+            "image_assets_cached": None,
+            "image_assets_skipped": None,
+        },
+        "policy": {
+            "refresh_mode": args.refresh_mode,
+            "article_count": args.count,
+            "incremental_max_pages": args.incremental_max_pages,
+            "content_limit": args.content_limit,
+            "content_passes": args.content_passes,
+            "asset_filter_ocr": args.asset_filter_ocr,
+        },
+        "outputs": {key: str(value) for key, value in outputs.items()},
+        "events": [],
+    }
+
+
+def write_daily_manifest(manifest: dict[str, object], *paths: Path) -> None:
+    for path in paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def daily_progress(path: Path, *, stage: str, status: str, **payload: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    event = {"ts": utc_now_iso(), "stage": stage, "status": status, **payload}
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def write_json_file(path: Path, payload: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def run_daily_refresh_metadata(*, store: Store, adapter: WeChatDownloadAPIAdapter, args: argparse.Namespace) -> dict[str, object]:
+    tier = None if args.tier == "all" else args.tier
+    max_sources = effective_unbounded_limit(args.max_sources)
+    sources = store.list_collectable_sources(tier=tier, limit=max_sources)
+    print(
+        f"mpfeed: refreshing article metadata for {len(sources)} active source(s)",
+        file=sys.stderr,
+        flush=True,
+    )
+    results: list[dict[str, object]] = []
+    skipped: list[dict[str, object]] = []
+    total_articles = 0
+    progress_every = max(0, int(args.progress_every or 0))
+    max_consecutive_failures = max(0, int(args.max_consecutive_refresh_failures or 0))
+    consecutive_failures = 0
+    for index, source in enumerate(sources):
+        result = refresh_article_metadata_for_source(store=store, adapter=adapter, source=source, args=args)
+        if result["status"] == "skipped":
+            skipped.append(result)
+        else:
+            results.append(result)
+            total_articles += int(result.get("articles_upserted") or result.get("count") or 0)
+            if result.get("ok") is False:
+                consecutive_failures += 1
+            else:
+                consecutive_failures = 0
+        if progress_every and ((index + 1) % progress_every == 0 or index == len(sources) - 1):
+            print_article_metadata_progress(index, sources, results, skipped, total_articles, source)
+        if max_consecutive_failures and consecutive_failures >= max_consecutive_failures:
+            return {
+                "tier": args.tier,
+                "sources_seen": len(sources),
+                "sources_processed": index + 1,
+                "sources_skipped": len(skipped),
+                "articles_saved": total_articles,
+                "status": "aborted",
+                "abort_reason": "consecutive_refresh_failures",
+                "max_consecutive_refresh_failures": max_consecutive_refresh_failures,
+                "results": results,
+                "skipped": skipped,
+            }
+        delay_between_items(index, len(sources), args.delay_min, args.delay_max, disabled=args.no_delay)
+    return {
+        "tier": args.tier,
+        "sources_seen": len(sources),
+        "sources_processed": len(sources),
+        "sources_skipped": len(skipped),
+        "articles_saved": total_articles,
+        "status": "ok",
+        "results": results,
+        "skipped": skipped,
+    }
+
+
+def write_daily_feed_exports(*, store: Store, args: argparse.Namespace, outputs: dict[str, Path]) -> None:
+    summary = store.feed_summary()
+    feed_rows = store.list_feed_items(limit=args.feed_limit)
+    failed_rows = store.list_feed_items(limit=args.feed_limit, crawl_status="content_failed")
+    write_feed_summary_file(outputs["summary"], summary, "json")
+    write_feed_items_file(outputs["feed"], feed_rows, "csv")
+    write_feed_items_file(outputs["failures"], failed_rows, "csv")
+
+
+def write_daily_digest_packs(*, store: Store, output_dir: Path, limit: int, min_score: float) -> list[dict[str, object]]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    packs = []
+    for target in (
+        "daily_digest",
+        "weekly_report",
+        "strategy_backlog",
+        "market_view",
+        "industry_tracking",
+        "risk_monitoring",
+    ):
+        rows = store.list_digests(
+            limit=limit,
+            application_target=target,
+            min_score=min_score,
+            analysis_stage="content",
+        )
+        path = output_dir / f"{target}.md"
+        path.write_text(format_digests_markdown(rows) + "\n", encoding="utf-8")
+        context_rows = build_digest_context_rows(
+            store=store,
+            limit=limit,
+            application_target=target,
+            min_score=min_score,
+            analysis_stage="content",
+            include_html=False,
+            include_assets=True,
+            require_content=False,
+            max_content_chars=0,
+        )
+        context_path = output_dir / f"{target}.context.json"
+        write_json_file(context_path, context_rows)
+        packs.append({"target": target, "path": str(path), "context_path": str(context_path), "count": len(rows)})
+    return packs
+
+
 def cmd_run_feed(args: argparse.Namespace) -> int:
     applied_config = apply_run_feed_config(args)
     store = get_store(args)
@@ -3987,6 +4483,8 @@ def cmd_run_feed(args: argparse.Namespace) -> int:
         skipped = []
         total_articles = 0
         progress_every = max(0, int(getattr(args, "progress_every", 0) or 0))
+        max_consecutive_failures = max(0, int(getattr(args, "max_consecutive_refresh_failures", 0) or 0))
+        consecutive_failures = 0
         for index, source in enumerate(sources):
             result = refresh_article_metadata_for_source(store=store, adapter=adapter, source=source, args=args)
             if result["status"] == "skipped":
@@ -3994,8 +4492,51 @@ def cmd_run_feed(args: argparse.Namespace) -> int:
             else:
                 results.append(result)
                 total_articles += int(result.get("articles_upserted") or result.get("count") or 0)
+                if result.get("ok") is False:
+                    consecutive_failures += 1
+                else:
+                    consecutive_failures = 0
             if progress_every and ((index + 1) % progress_every == 0 or index == len(sources) - 1):
                 print_article_metadata_progress(index, sources, results, skipped, total_articles, source)
+            if max_consecutive_failures and consecutive_failures >= max_consecutive_failures:
+                print(
+                    "mpfeed: aborting article metadata refresh after "
+                    f"{consecutive_failures} consecutive source failure(s); "
+                    "check downloader/network status before retrying.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                refreshed = {
+                    "tier": args.tier,
+                    "sources_seen": len(sources),
+                    "sources_processed": index + 1,
+                    "sources_skipped": len(skipped),
+                    "articles_saved": total_articles,
+                    "status": "aborted",
+                    "abort_reason": "consecutive_refresh_failures",
+                    "max_consecutive_refresh_failures": max_consecutive_failures,
+                    "policy": {
+                        "article_count": args.count,
+                        "begin": args.begin,
+                        "refresh_mode": args.refresh_mode,
+                        "incremental_max_pages": args.incremental_max_pages,
+                        "incremental_page_delay_min_seconds": 0 if args.no_delay else args.incremental_page_delay_min,
+                        "incremental_page_delay_max_seconds": 0 if args.no_delay else args.incremental_page_delay_max,
+                        "delay_min_seconds": 0 if args.no_delay else args.delay_min,
+                        "delay_max_seconds": 0 if args.no_delay else args.delay_max,
+                        "retries": args.retries,
+                        "backoff_seconds": args.backoff_seconds,
+                        "max_sources": args.max_sources,
+                    },
+                    "results": results,
+                    "skipped": skipped,
+                }
+                work_dir.mkdir(parents=True, exist_ok=True)
+                (work_dir / "article-refresh-aborted.json").write_text(
+                    json.dumps(refreshed, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                return 2
             delay_between_items(index, len(sources), args.delay_min, args.delay_max, disabled=args.no_delay)
 
         refreshed = {
@@ -4059,7 +4600,7 @@ def cmd_run_feed(args: argparse.Namespace) -> int:
             delay_max=args.content_delay_max,
             passes=args.content_passes,
             pass_cooldown_seconds=args.content_pass_cooldown_seconds,
-            progress_every=args.progress_every,
+            progress_every=args.content_progress_every if args.content_progress_every is not None else args.progress_every,
             no_delay=args.no_delay,
         )
         content["retention_levels"] = list(retention_levels) if retention_levels else "all"

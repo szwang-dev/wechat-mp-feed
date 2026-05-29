@@ -16,10 +16,12 @@ Skill 是 agent 使用项目的标准入口。CLI 负责执行，Skill 说明 ag
 
 - 运行离线 feed 验证；
 - 从名单、截图、录屏或文章链接批量接入首次公众号列表；
-- 调用 `mpfeed run feed --config`；
+- 使用 `mpfeed run daily` 执行定时刷新或 agent 监督运行；
+- 使用 `mpfeed run feed --config` 执行手动刷新和导出；
 - 读取 feed 健康状态和失败表；
 - 执行两阶段语义 feed 工作流；
 - 导出文章级 LLM jobs 和最终应用层摘要上下文（digest context）；
+- 通过受控的 `archive assets` 命令归档高价值文章图片资产；
 - 通过安全来源命令处理单账号 intake、分类确认、退订和重新启用；
 - 使用用户配置的本地路径保存公众号名单、录屏、下载服务凭据和数据库；
 - 在 feed 层之上构建应用层 inbox / 摘要（digest），包括内置金融投研工作流。
@@ -32,10 +34,12 @@ Skill 是 agent 使用项目的标准入口。CLI 负责执行，Skill 说明 ag
 - 使用 `agent-smoke` 验证运行环境；
 - 首次接入时使用分阶段审核表处理账号身份和分类；
 - 以审核后的来源库作为账号身份依据；
+- 汇报定时日更状态前先读取 `run-manifest.json` 和 `progress.ndjson`；
 - 基于 `feed-summary` 汇报 feed 健康状态；
 - 基于 `feed-failures` 判断重试范围；
 - 使用分阶段 article LLM jobs 执行文章语义分析；
 - 最终报告需要原文证据时使用摘要上下文（`digest-context`）读取正文、结构化内容和图片资产；
+- 使用 `archive assets` 缓存本地图片，并默认保留低价值图片过滤，除非用户明确要求保存全部图片；
 - 来源分类和订阅状态只通过 `mpfeed source` 安全写入口更新；
 - 下载服务登录失效时清楚提示扫码需求；
 - 把生成文件保存在用户控制的本地路径。

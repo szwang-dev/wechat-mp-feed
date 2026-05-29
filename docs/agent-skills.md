@@ -16,10 +16,12 @@ The skill teaches an agent how to:
 
 - run an offline feed validation test;
 - onboard large first-run account lists from files, screenshots, recordings, or article URLs;
-- operate `mpfeed run feed --config`;
+- operate `mpfeed run daily` for scheduled or agent-supervised refreshes;
+- operate `mpfeed run feed --config` for manual refreshes and exports;
 - inspect feed health and failures;
 - run the two-stage semantic feed workflow;
 - export article-level LLM jobs and application-layer digest context;
+- archive high-value article assets through the controlled `archive assets` command;
 - manage single-source intake, classification confirmation, unsubscribe, and reactivation through safe source commands;
 - keep private WeChat/account data outside the public repository;
 - build application inbox/digest workflows above the feed layer, including the built-in finance research workflow.
@@ -32,10 +34,12 @@ An agent using this skill should:
 - run the `agent-smoke` validation command before claiming the environment is ready;
 - use staged review tables for account identity and classification during first-run onboarding;
 - use reviewed sources as the identity source of truth;
+- read `run-manifest.json` and `progress.ndjson` before reporting scheduled daily run status;
 - read `feed-summary` before summarizing feed health;
 - read `feed-failures` before recommending retries;
 - use staged article LLM jobs before semantic article analysis;
 - use `digest-context` when final reports require original text, structured content, or image assets;
+- use `archive assets` for local image caching and keep default low-value image filtering enabled unless the user explicitly asks to save every image;
 - write source classification and subscription state only through `mpfeed source` helpers;
 - report downloader login needs clearly and wait for the user to scan when needed;
 - keep generated files under user-controlled local paths.

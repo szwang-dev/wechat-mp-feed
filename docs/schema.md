@@ -111,8 +111,8 @@ Images, video metadata, and other embedded assets.
 | `block_index` | integer nullable | index in `article_contents.content_structure` |
 | `content_ref` | text nullable | stable reference such as `block:12` |
 | `local_path` | text nullable | cached file path |
-| `metadata` | json nullable | cover, dimensions, platform, etc. |
-| `download_status` | text | `url_only`, `cached`, `failed`, `unsupported` |
+| `metadata` | json nullable | cover, dimensions, platform, archive decision, OCR text when enabled, etc. |
+| `download_status` | text | `url_only`, `cached`, `skipped`, `failed`, `unsupported` |
 | `created_at` | timestamp | |
 
 ### `classifications`

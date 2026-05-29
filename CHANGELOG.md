@@ -4,6 +4,22 @@
 
 No changes yet.
 
+## v0.3.0 - 2026-05-29
+
+`v0.3.0` makes the feed layer easier to run as a scheduled, agent-supervised workflow and strengthens evidence-preserving digest exports.
+
+- Add `mpfeed run daily`, a resumable daily runner for scheduled jobs. It writes manifest and progress files, exports metadata-stage and content-stage LLM jobs, imports staged LLM results, fetches retained content, archives selected assets, and exports digest packs.
+- Add explicit daily runner states such as `RUNNING`, `WAITING_FOR_METADATA_LLM`, `WAITING_FOR_CONTENT_LLM`, `DONE`, `LOGIN_REQUIRED`, `DOWNLOADER_UNREACHABLE`, `REFRESH_CIRCUIT_BREAKER`, and `FAILED`.
+- Add dated daily output structure with `run-manifest.json`, `run-manifest-latest.json`, `progress.ndjson`, feed exports, LLM job files, asset cache files, and `digest-packs/`.
+- Improve agent handling guidance so schedulers and agents inspect manifest/progress files before declaring a blocked run.
+- Make asset archival selective by default. `mpfeed archive assets` now filters low-value images before saving local files, including QR codes, icons, divider bars, small logos, low-detail decorative images, and promotional/template images.
+- Add `download_status=skipped` for intentionally skipped image assets and store skip reasons under `article_assets.metadata.archive_decision`.
+- Add optional local OCR signal support for asset filtering with `--asset-filter-ocr paddle`.
+- Treat cached and skipped assets together when deciding whether a `full_archive` article's image archival is complete.
+- Update the agent skill package with `run daily`, manifest/progress handling, asset archival rules, LLM batching guidance, and downloader login QR handling.
+- Move the Chinese README entry point to the repository root as `README.zh-CN.md` and update public documentation links.
+- Extend tests for the daily runner, manifest waiting states, asset filtering, skipped asset status, and archive completion behavior.
+
 ## v0.2.0 - 2026-05-20
 
 `v0.2.0` upgrades the reviewable feed layer into an agent-oriented semantic feed system with domain-pack workflows and a built-in finance research pack.
